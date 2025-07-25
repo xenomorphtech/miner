@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository contains a CUDA-based miner that integrates the BLAKE3 hashing algorithm. The code is organized to keep third-party libraries isolated under `third_party/`, with all build artifacts placed in `build/`.
+The code is organized to keep third-party libraries isolated under `third_party/`, with all build artifacts placed in `build/`.
 
 ## Prerequisites
 
