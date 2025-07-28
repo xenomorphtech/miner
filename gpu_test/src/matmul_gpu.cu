@@ -1,0 +1,204 @@
+
+#include <stdint.h>
+#include <cuda_runtime.h>
+
+#ifdef __CUDA_ARCH__
+#define cudaDeviceSynchronize()  /* no‑op in device code */
+#endif
+
+#define BLAZE3_DISABLE_RECURSIVE 1
+#include "../include/blaze3.cuh"
+
+using u32 = uint32_t;
+
+__device__ __constant__ uint32_t G_IV[8] = {
+  0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+  0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+};
+
+/*-------------------- kernel 1 : 8 seeds / warp --------------------------*/
+__global__ void root_hash8(const uint8_t * __restrict__ d_seeds,
+                           u32          * __restrict__ d_roots,
+                           int seeds)
+{
+    const int pack = blockIdx.x;                 // one warp hashes 8 seeds
+    const int lane = threadIdx.x;                // 0 … 31
+    const int idx0 = pack * 8;                   // first seed in this pack
+    if (idx0 + 7 >= seeds) return;
+
+    /* ---- 1. load 8 seeds (240 B each) into shared memory -------------- */
+    __shared__ uint8_t sm[8][240];
+    for (int i = lane; i < 240; i += 32) {
+        #pragma unroll
+        for (int s = 0; s < 8; ++s)
+            sm[s][i] = d_seeds[(idx0 + s) * 240 + i];
+    }
+    __syncthreads();
+
+    /* ---- 2. hash each seed, one lane per seed ------------------------- */
+
+    if (lane < 8) {
+
+        const uint8_t *msg = sm[lane];
+        uint32_t cv[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) cv[i] = G_IV[i];
+
+        printf("GPU lane %08X\n",
+                lane);
+
+        uint32_t m[16];
+        uint32_t tmp_state[16];
+
+        /* four 64‑byte blocks (last one is 48 B + 16 × 0 padding) */
+        #pragma unroll
+
+
+        for (int blk = 0; blk < 4; ++blk) {
+
+            const uint32_t block_len = (blk == 3 ? 48 : 64);
+            const uint8_t *src       = msg + blk * 64;
+
+            /* --- build message words with zero-padding -------------------- */
+            #pragma unroll
+            for (int w = 0; w < 16; ++w) m[w] = 0;
+            #pragma unroll
+            for (int i = 0; i < block_len; ++i)
+                reinterpret_cast<uint8_t*>(m)[i] = src[i];
+
+            uint32_t flags =
+                  (blk == 0 ? CHUNK_START : 0)
+                | (blk == 3 ? CHUNK_END   : 0)
+                | (blk == 3 ? ROOT        : 0);
+
+            const uint64_t counter_bytes = static_cast<uint64_t>(blk) * 64ULL;
+
+            g_compress(cv, m,
+                       counter_bytes,
+                       block_len,
+                       flags,
+                       tmp_state);
+
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) cv[w] = tmp_state[w];
+
+        }
+
+
+
+        printf("? GPU root %08X %08X %08X %08X\n",
+                cv[0], cv[1], cv[2], cv[3]);
+
+        /* ---- 3. write the 32‑byte root out --------------------------- */
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            d_roots[(idx0 + lane) * 8 + w] = cv[w];
+        }
+
+
+
+
+
+    }
+}
+
+/*-------------------- kernel 2 : XOF expansion ---------------------------*/
+__device__ inline void expand_one(const u32  root[8],
+                                  uint64_t   ctr,
+                                  u32        out[16])          // 16 words = 64 bytes
+{
+    u32 m[16] = {0};
+    m[12] = (u32)ctr;
+    m[13] = (u32)(ctr >> 32);
+    m[15] = DERIVE_KEY_MATERIAL;
+
+    u32 cv[8];
+    #pragma unroll
+    for (int w = 0; w < 8; ++w) cv[w] = root[w];
+
+    uint32_t tmp_state[16];
+    g_compress(cv, m,
+               /*counter*/ 0ULL,       // <- 0 for key-material blocks
+               64,
+               DERIVE_KEY_MATERIAL,
+               tmp_state);
+
+    /* return the full 64-byte output block */
+    #pragma unroll
+    for (int w = 0; w < 16; ++w) out[w] = tmp_state[w];
+}
+
+__global__ void xof_expand(const u32 *d_roots,
+                           uint8_t  *d_mat,
+                           size_t    per_mat,
+                           int       batch)
+{
+    const uint64_t tid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t blocks = 25120;
+    const int      mat_id = tid / blocks;
+    if (mat_id >= batch) return;
+
+    const uint32_t blk = tid % blocks;
+
+    u32 block[16];
+    expand_one(d_roots + mat_id * 8, blk, block);
+
+    uint8_t *dst = d_mat + (size_t)mat_id * per_mat + blk * 64;
+    #pragma unroll
+    for (int w = 0; w < 16; ++w)
+        reinterpret_cast<u32 *>(dst)[w] = block[w];
+}
+
+/*-------------------- public facade --------------------------------------*/
+extern "C"
+void blake3_matmul_cuda(const void *d_seeds,size_t seed_len,
+                        void *d_out,size_t prod_len,int batch,
+                        cudaStream_t s=0)
+{
+    constexpr size_t SEED=240, MAT=1'607'680, PROD=16*16*4;
+    if(seed_len!=SEED||prod_len!=PROD) return;
+
+    static u32 *d_roots=nullptr; static int cap=0;
+    if(batch>cap){ if(d_roots)cudaFree(d_roots);
+                    cudaMalloc(&d_roots,batch*32); cap=batch;}
+
+    int packs=(batch+7)/8;
+    root_hash8<<<packs,32,0,s>>>(static_cast<const uint8_t*>(d_seeds),
+                                 d_roots,batch);
+
+    uint64_t threads=(uint64_t)batch*25120;
+    dim3 blk(256), grd((threads+255)/256);
+    static uint8_t *d_mat=nullptr; static int matcap=0;
+    if(batch>matcap){ if(d_mat)cudaFree(d_mat);
+                      cudaMalloc(&d_mat,batch*MAT); matcap=batch;}
+    xof_expand<<<grd,blk,0,s>>>(d_roots,d_mat,MAT,batch);
+
+    /* GEMM on device – naïve 16×16×k kernel (k=50240) */
+    const int ROWS=16,COLS=16,K=50240;
+    int32_t *prod = static_cast<int32_t*>(d_out);
+
+    // 1 thread per element
+    __global__ void gemm(int32_t*,const uint8_t*,const int8_t*);
+    gemm<<<batch,dim3(ROWS,COLS,1),0,s>>>(
+            prod,
+            d_mat,                                         // A  uint8_t*
+            reinterpret_cast<const int8_t*>(d_mat+ROWS*K));// B  int8_t*
+}
+
+/* naive GEMM kernel (will be inlined above) */
+__global__ void gemm(int32_t *C,const uint8_t *A,const int8_t *B)
+{
+    const int batch = gridDim.x;
+    const int bid   = blockIdx.x;
+    const int i = threadIdx.x, j = threadIdx.y;
+    if(i>=16||j>=16) return;
+
+    const uint8_t* a = A + (size_t)bid*16*50240;
+    const int8_t * b = B + (size_t)bid*50240*16;
+
+    int32_t sum=0;
+    for(int k=0;k<50240;++k)
+        sum+=int32_t(a[i*50240+k])*int32_t(b[k*16+j]);
+
+    C[bid*256 + i*16 + j]=sum;
+}
