@@ -6,8 +6,11 @@
 #define cudaDeviceSynchronize()  /* no‑op in device code */
 #endif
 
+
 #define BLAZE3_DISABLE_RECURSIVE 1
 #include "../include/blaze3.cuh"
+#include <stdio.h>            /* printf inside device code */
+
 
 using u32 = uint32_t;
 
@@ -44,9 +47,6 @@ __global__ void root_hash8(const uint8_t * __restrict__ d_seeds,
         #pragma unroll
         for (int i = 0; i < 8; ++i) cv[i] = G_IV[i];
 
-        printf("GPU lane %08X\n",
-                lane);
-
         uint32_t m[16];
         uint32_t tmp_state[16];
 
@@ -66,39 +66,42 @@ __global__ void root_hash8(const uint8_t * __restrict__ d_seeds,
             for (int i = 0; i < block_len; ++i)
                 reinterpret_cast<uint8_t*>(m)[i] = src[i];
 
-            uint32_t flags =
-                  (blk == 0 ? CHUNK_START : 0)
-                | (blk == 3 ? CHUNK_END   : 0)
-                | (blk == 3 ? ROOT        : 0);
+            /* BLAKE3 per‑block flags inside a chunk (no ROOT here) */
+            uint32_t flags = ((blk == 0) ? CHUNK_START : 0) |
+                ((blk == 3) ? CHUNK_END   : 0);
 
-            const uint64_t counter_bytes = static_cast<uint64_t>(blk) * 64ULL;
+                /* Inside one chunk the counter is always 0 */
+            const uint64_t counter = 0ULL;
 
             g_compress(cv, m,
-                       counter_bytes,
+                       counter,
                        block_len,
                        flags,
                        tmp_state);
 
+
+            /* XOR low and high halves to build the next chaining value */
             #pragma unroll
-            for (int w = 0; w < 8; ++w) cv[w] = tmp_state[w];
+            for (int w = 0; w < 8; ++w)
+                cv[w] = tmp_state[w];    // already XORed inside g_compress
+
 
         }
 
-
-
-        printf("? GPU root %08X %08X %08X %08X\n",
-                cv[0], cv[1], cv[2], cv[3]);
-
         /* ---- 3. write the 32‑byte root out --------------------------- */
+
+
+        #ifdef DEBUG_GPU
+            if (idx0 == 0 && lane == 0) {          // first seed only
+                printf("GPU‑kern cv[0..3] = %08X %08X %08X %08X\n",
+                       cv[0], cv[1], cv[2], cv[3]);
+            }
+        #endif
+
         #pragma unroll
         for (int w = 0; w < 8; ++w) {
             d_roots[(idx0 + lane) * 8 + w] = cv[w];
         }
-
-
-
-
-
     }
 }
 
@@ -143,6 +146,13 @@ __global__ void xof_expand(const u32 *d_roots,
     u32 block[16];
     expand_one(d_roots + mat_id * 8, blk, block);
 
+    #ifdef DEBUG_GPU
+        if (mat_id == 0 && blk == 0 && threadIdx.x == 0) {
+            printf("GPU XOF blk0[0..3] = %08X %08X %08X %08X\n",
+                   block[0], block[1], block[2], block[3]);
+        }
+    #endif
+
     uint8_t *dst = d_mat + (size_t)mat_id * per_mat + blk * 64;
     #pragma unroll
     for (int w = 0; w < 16; ++w)
@@ -165,6 +175,15 @@ void blake3_matmul_cuda(const void *d_seeds,size_t seed_len,
     int packs=(batch+7)/8;
     root_hash8<<<packs,32,0,s>>>(static_cast<const uint8_t*>(d_seeds),
                                  d_roots,batch);
+
+    #ifdef DEBUG_GPU
+    {
+        uint32_t h_roots[8];
+        cudaMemcpy(h_roots, d_roots, sizeof(h_roots), cudaMemcpyDeviceToHost);
+        printf("GPU‑host d_roots[0..3] = %08X %08X %08X %08X\n",
+               h_roots[0], h_roots[1], h_roots[2], h_roots[3]);
+    }
+    #endif
 
     uint64_t threads=(uint64_t)batch*25120;
     dim3 blk(256), grd((threads+255)/256);

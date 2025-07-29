@@ -1,5 +1,21 @@
 #include "blaze3_cpu.cuh"
 
+#include <stdio.h>         /* printf inside device code */
+
+/* ============ helpers for optional tracing ===================== */
+
+#ifdef DEBUG_TRACE
+#define GPU_PRINT(tag, st)                                               \
+    do {                                                                 \
+        if (threadIdx.x == 0 && blockIdx.x == 0) {                       \
+            printf("GPU STATE %-5s %08X %08X %08X %08X\n", tag,                \
+                   (st)[0], (st)[1], (st)[2], (st)[3]);                  \
+        }                                                                \
+    } while (0)
+#else
+#define GPU_PRINT(tag, st)  ((void)0)
+#endif
+
 // Number of threads per thread block
 __constant__ const int NUM_THREADS = 16;
 
@@ -85,27 +101,46 @@ __device__ void g_compress(
     state[14] = block_len;
     state[15] = flags;
 
+    GPU_PRINT("init", state);
+
+
     u32 block[16];
     g_memcpy(block, block_words, 64);
 
     g_round(state, block); // round 1
+    GPU_PRINT("r1", state);
+
     g_permute(block);
     g_round(state, block); // round 2
+    GPU_PRINT("r2", state);
+
     g_permute(block);
     g_round(state, block); // round 3
+    GPU_PRINT("r3", state);
+
     g_permute(block);
     g_round(state, block); // round 4
+    GPU_PRINT("r4", state);
+
     g_permute(block);
     g_round(state, block); // round 5
+    GPU_PRINT("r5", state);
+
     g_permute(block);
     g_round(state, block); // round 6
+    GPU_PRINT("r6", state);
+
     g_permute(block);
     g_round(state, block); // round 7
+    GPU_PRINT("r7", state);
+
 
     for(int i=0; i<8; i++){
         state[i] ^= state[i + 8];
         state[i + 8] ^= chaining_value[i];
     }
+
+    GPU_PRINT("final", state);
 }
 
 __device__ void g_words_from_little_endian_bytes(

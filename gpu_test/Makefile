@@ -2,17 +2,23 @@
 CUDA_ARCH   := sm_89
 
 NVCC        := nvcc
-NVCCFLAGS   := -arch=$(CUDA_ARCH) -O3 -std=c++17 -rdc=true -Iinclude -Iblake3
+NVCCFLAGS   := -arch=$(CUDA_ARCH) -O3 -std=c++17 -rdc=true \
+               -Iinclude -Iblake3 -DDEBUG_GPU -DDEBUG_TRACE
 
 CXX         := g++
 CUDA_PATH   ?= /usr/local/cuda
-CXXFLAGS    := -O3 -std=c++17 -Iinclude -Iblake3 -I$(CUDA_PATH)/include
+CXXFLAGS    := -O3 -std=c++17 \
+               -Iinclude -Iblake3 -I$(CUDA_PATH)/include \
+               -DDEBUG_CPU -DDEBUG_TRACE \
+               -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX512    := -O3 -std=c++17 \
+               -Iinclude -Iblake3 -I$(CUDA_PATH)/include -DDEBUG_CPU -DDEBUG_TRACE
 
 CC          := gcc
 CFLAGS      := -O3 -std=c99 \
                -Iblake3/c \
                -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 \
-               -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512
+               -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 \
+               -DDEBUG_CPU
 
 LDFLAGS     := -L/usr/local/cuda/lib64 -lcudart -lcudadevrt
 

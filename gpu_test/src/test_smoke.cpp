@@ -5,11 +5,13 @@
 #include <cuda_runtime.h>
 #include <cstring>
 
+
+
 extern "C" void blake3_matmul_cuda(const void*,size_t,void*,size_t,int,cudaStream_t);
 void cpu_reference(const uint8_t*, std::vector<int32_t>&);
 
 int main(){
-    const int BATCH=8;                // small for first run
+    const int BATCH = 1;;                // small for first run
     std::vector<uint8_t> h_seeds(BATCH*240);
     std::mt19937_64 rng(123);
     for(auto &b:h_seeds) b=rng()&0xFF;
