@@ -21,10 +21,15 @@ __constant__ const int NUM_THREADS = 16;
 
 // redefine functions, but for the GPU
 // all of them are the same but with g_ prefixed
-__constant__ const u32 g_IV[8] = {
-    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
-};
+//
+//
+//__constant__ const u32 g_IV[8] = {
+//    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+//    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+//};
+//
+//
+extern __device__ __constant__ uint32_t g_IV[8];
 
 __constant__ const int g_MSG_PERMUTATION[] = {
     2, 6, 3, 10, 7, 0, 4, 13,
@@ -32,7 +37,8 @@ __constant__ const int g_MSG_PERMUTATION[] = {
 };
 
 __device__ u32 g_rotr(u32 value, int shift) {
-    return (value >> shift)|(value << (usize - shift));
+    //return (value >> shift)|(value << (usize - shift));
+    return (value >> shift) | (value << (32 - shift));
 }
 
 __device__ void g_g(u32 state[16], u32 a, u32 b, u32 c, u32 d, u32 mx, u32 my) {

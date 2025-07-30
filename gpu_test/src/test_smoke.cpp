@@ -5,8 +5,6 @@
 #include <cuda_runtime.h>
 #include <cstring>
 
-
-
 extern "C" void blake3_matmul_cuda(const void*,size_t,void*,size_t,int,cudaStream_t);
 void cpu_reference(const uint8_t*, std::vector<int32_t>&);
 

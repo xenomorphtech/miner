@@ -11,41 +11,65 @@
 #include "../include/blaze3.cuh"
 #include <stdio.h>            /* printf inside device code */
 
+__device__ __constant__ uint32_t g_IV[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+};
 
 using u32 = uint32_t;
 
-__device__ __constant__ uint32_t G_IV[8] = {
-  0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
-  0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
-};
 
 /*-------------------- kernel 1 : 8 seeds / warp --------------------------*/
 __global__ void root_hash8(const uint8_t * __restrict__ d_seeds,
                            u32          * __restrict__ d_roots,
                            int seeds)
 {
+    #ifdef DEBUG_TRACE
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            printf("DEVICE args  d_seeds=%p  d_roots=%p  seeds=%d\n",
+                   d_seeds, d_roots, seeds);
+        }
+    #endif
+
     const int pack = blockIdx.x;                 // one warp hashes 8 seeds
     const int lane = threadIdx.x;                // 0 … 31
-    const int idx0 = pack * 8;                   // first seed in this pack
-    if (idx0 + 7 >= seeds) return;
+
+    const int idx0  = pack * 8;
+    if (idx0 >= seeds) return;
+
+    const int seeds_in_pack = min(8, seeds - idx0);
+
+    //printf("---- %d, %d, %d, %d \n", pack, lane, idx0, seeds);
+
 
     /* ---- 1. load 8 seeds (240 B each) into shared memory -------------- */
     __shared__ uint8_t sm[8][240];
     for (int i = lane; i < 240; i += 32) {
         #pragma unroll
-        for (int s = 0; s < 8; ++s)
+        for (int s = 0; s < seeds_in_pack; ++s)
             sm[s][i] = d_seeds[(idx0 + s) * 240 + i];
     }
+
+
+
     __syncthreads();
+
+
 
     /* ---- 2. hash each seed, one lane per seed ------------------------- */
 
-    if (lane < 8) {
+    if (lane < seeds_in_pack) {
 
         const uint8_t *msg = sm[lane];
         uint32_t cv[8];
         #pragma unroll
-        for (int i = 0; i < 8; ++i) cv[i] = G_IV[i];
+        for (int i = 0; i < 8; ++i) cv[i] = g_IV[i];
+
+
+
+        printf("DBG cv after IV copy = %08X %08X %08X %08X idx = %d \n",
+                           cv[0], cv[1], cv[2], cv[3], idx0);
+
 
         uint32_t m[16];
         uint32_t tmp_state[16];
@@ -73,6 +97,30 @@ __global__ void root_hash8(const uint8_t * __restrict__ d_seeds,
                 /* Inside one chunk the counter is always 0 */
             const uint64_t counter = 0ULL;
 
+                        /* ---- DEBUG: print the inputs fed to g_compress -------- */
+            #ifdef DEBUG_TRACE
+                        if (idx0 == 0 && lane == 0 && blk == 0) {
+                            printf("DBG pre‑cmp cv[0..3]=%08X %08X %08X %08X\n",
+                                   cv[0], cv[1], cv[2], cv[3]);
+                            printf("DBG pre‑cmp m[0..3] =%08X %08X %08X %08X  "
+                                   "len=%u flags=%02X\n",
+                                   m[0], m[1], m[2], m[3], block_len, flags);
+                        }
+            #endif
+
+            #ifdef DEBUG_TRACE
+                        if (idx0 == 0 && lane == 0) {          /* first seed, lane 0 */
+                            /* first 4 bytes of the seed we are hashing */
+                            uint32_t first_word;
+                            memcpy(&first_word, msg, 4);
+                            printf("DBG seed0 word0 = %08X\n", first_word);
+
+                            /* chaining value BEFORE g_compress ------------------ */
+                            printf("DBG cv in  [%d] = %08X %08X %08X %08X\n",
+                                   blk, cv[0], cv[1], cv[2], cv[3]);
+                        }
+            #endif
+
             g_compress(cv, m,
                        counter,
                        block_len,
@@ -91,7 +139,7 @@ __global__ void root_hash8(const uint8_t * __restrict__ d_seeds,
         /* ---- 3. write the 32‑byte root out --------------------------- */
 
 
-        #ifdef DEBUG_GPU
+        #ifdef DEBUG_TRACE
             if (idx0 == 0 && lane == 0) {          // first seed only
                 printf("GPU‑kern cv[0..3] = %08X %08X %08X %08X\n",
                        cv[0], cv[1], cv[2], cv[3]);
@@ -146,7 +194,7 @@ __global__ void xof_expand(const u32 *d_roots,
     u32 block[16];
     expand_one(d_roots + mat_id * 8, blk, block);
 
-    #ifdef DEBUG_GPU
+    #ifdef DEBUG_TRACE
         if (mat_id == 0 && blk == 0 && threadIdx.x == 0) {
             printf("GPU XOF blk0[0..3] = %08X %08X %08X %08X\n",
                    block[0], block[1], block[2], block[3]);
@@ -173,15 +221,27 @@ void blake3_matmul_cuda(const void *d_seeds,size_t seed_len,
                     cudaMalloc(&d_roots,batch*32); cap=batch;}
 
     int packs=(batch+7)/8;
+
+    assert(batch > 0);
+    printf("HOST launching root_hash8 batch=%d packs=%d\n", batch, packs);
+
+
     root_hash8<<<packs,32,0,s>>>(static_cast<const uint8_t*>(d_seeds),
                                  d_roots,batch);
 
-    #ifdef DEBUG_GPU
+    #ifdef DEBUG_TRACE
     {
         uint32_t h_roots[8];
         cudaMemcpy(h_roots, d_roots, sizeof(h_roots), cudaMemcpyDeviceToHost);
         printf("GPU‑host d_roots[0..3] = %08X %08X %08X %08X\n",
                h_roots[0], h_roots[1], h_roots[2], h_roots[3]);
+
+        /* --- read the IV directly from constant memory ---------------- */
+        uint32_t iv_host[8];
+        cudaMemcpyFromSymbol(iv_host, g_IV, sizeof(iv_host), 0,
+                                 cudaMemcpyDeviceToHost);
+        printf("GPU‑host g_IV[0..3]    = %08X %08X %08X %08X\n",
+                   iv_host[0], iv_host[1], iv_host[2], iv_host[3]);
     }
     #endif
 
