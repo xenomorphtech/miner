@@ -85,6 +85,12 @@ INLINE void compress_pre(uint32_t state[16], const uint32_t cv[8],
 
   CPU_PRINT_STATE("init", state);
 
+
+  printf("CPU INFO counter1   %08X\n", state[12]);
+  printf("CPU INFO counter2   %08X\n", state[13]);
+  printf("CPU INFO block_len  %08X\n", state[14]);
+  printf("CPU INFO flags      %08X\n", state[15]);
+
   round_fn(state, &block_words[0], 0);
   CPU_PRINT_STATE("r1", state);
   round_fn(state, &block_words[0], 1);
@@ -127,7 +133,7 @@ void blake3_compress_xof_portable(const uint32_t cv[8],
 
   printf("CPU‑XOF  counter=%llu  flags=%02X\n",
     (unsigned long long)counter, flags);
-    
+
   uint32_t state[16];
   compress_pre(state, cv, block, block_len, counter, flags);
 

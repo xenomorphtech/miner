@@ -22,6 +22,8 @@ using u32 = uint32_t;
 /*-------------------- kernel 1 : 8 seeds / warp --------------------------*/
 __global__ void root_hash8(const uint8_t * __restrict__ d_seeds,
                            u32          * __restrict__ d_roots,
+                           /* new */      u32          * __restrict__ d_last_words,
+                           /* new */      uint8_t      * __restrict__ d_last_len,
                            int seeds)
 {
     #ifdef DEBUG_TRACE
@@ -90,9 +92,9 @@ __global__ void root_hash8(const uint8_t * __restrict__ d_seeds,
             for (int i = 0; i < block_len; ++i)
                 reinterpret_cast<uint8_t*>(m)[i] = src[i];
 
-            /* BLAKE3 per‑block flags inside a chunk (no ROOT here) */
-            uint32_t flags = ((blk == 0) ? CHUNK_START : 0) |
-                ((blk == 3) ? CHUNK_END   : 0);
+
+            uint32_t flags = (blk == 0 ? CHUNK_START : 0) |
+                           (blk == 3 ? (CHUNK_END | ROOT) : 0);
 
                 /* Inside one chunk the counter is always 0 */
             const uint64_t counter = 0ULL;
@@ -121,18 +123,20 @@ __global__ void root_hash8(const uint8_t * __restrict__ d_seeds,
                         }
             #endif
 
-            g_compress(cv, m,
-                       counter,
-                       block_len,
-                       flags,
-                       tmp_state);
+            g_compress(cv, m, counter, block_len, flags, tmp_state);
+
+                        if (blk == 3 && lane < seeds_in_pack) {
+                            u32 *dst = d_last_words + (idx0 + lane) * 16;
+                            #pragma unroll
+                            for (int w = 0; w < 16; ++w) dst[w] = m[w];
+                            d_last_len[idx0 + lane] = (uint8_t)block_len;   /* 48 */
+                        }
 
 
             /* XOR low and high halves to build the next chaining value */
             #pragma unroll
             for (int w = 0; w < 8; ++w)
                 cv[w] = tmp_state[w];    // already XORed inside g_compress
-
 
         }
 
@@ -155,34 +159,34 @@ __global__ void root_hash8(const uint8_t * __restrict__ d_seeds,
 
 /*-------------------- kernel 2 : XOF expansion ---------------------------*/
 __device__ inline void expand_one(const u32  root[8],
+                                  const u32  last_m[16],
+                                  uint32_t   last_len,
                                   uint64_t   ctr,
-                                  u32        out[16])          // 16 words = 64 bytes
+                                  u32        out[16])
 {
-    u32 m[16] = {0};
-    m[12] = (u32)ctr;
-    m[13] = (u32)(ctr >> 32);
-    m[15] = DERIVE_KEY_MATERIAL;
+    u32 m[16];
+    #pragma unroll
+    for (int w = 0; w < 16; ++w) m[w] = last_m[w];
 
     u32 cv[8];
     #pragma unroll
-    for (int w = 0; w < 8; ++w) cv[w] = root[w];
+    for (int i = 0; i < 8; ++i) cv[i] = root[i];
 
-    uint32_t tmp_state[16];
-    g_compress(cv, m,
-               /*counter*/ 0ULL,       // <- 0 for key-material blocks
-               64,
-               DERIVE_KEY_MATERIAL,
-               tmp_state);
+    const u32 xof_flags = (ROOT | CHUNK_END);   /* always 0x0A here   */
+
+    g_compress(cv, m, ctr, last_len, xof_flags, out);
 
     /* return the full 64-byte output block */
     #pragma unroll
-    for (int w = 0; w < 16; ++w) out[w] = tmp_state[w];
+    for (int w = 0; w < 8; ++w) out[w + 8] ^= root[w];           /* recover raw v'[i] */
 }
 
 __global__ void xof_expand(const u32 *d_roots,
-                           uint8_t  *d_mat,
-                           size_t    per_mat,
-                           int       batch)
+                           const u32 *d_last_words,
+                           const uint8_t *d_last_len,
+                            uint8_t  *d_mat,
+                            size_t    per_mat,
+                            int       batch)
 {
     const uint64_t tid   = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t blocks = 25120;
@@ -192,7 +196,11 @@ __global__ void xof_expand(const u32 *d_roots,
     const uint32_t blk = tid % blocks;
 
     u32 block[16];
-    expand_one(d_roots + mat_id * 8, blk, block);
+        expand_one(d_roots + mat_id * 8,
+                   d_last_words + mat_id * 16,
+                   d_last_len[mat_id],
+                   blk,
+                   block);
 
     #ifdef DEBUG_TRACE
         if (mat_id == 0 && blk == 0 && threadIdx.x == 0) {
@@ -216,9 +224,19 @@ void blake3_matmul_cuda(const void *d_seeds,size_t seed_len,
     constexpr size_t SEED=240, MAT=1'607'680, PROD=16*16*4;
     if(seed_len!=SEED||prod_len!=PROD) return;
 
-    static u32 *d_roots=nullptr; static int cap=0;
-    if(batch>cap){ if(d_roots)cudaFree(d_roots);
-                    cudaMalloc(&d_roots,batch*32); cap=batch;}
+        static u32    *d_roots      = nullptr;
+        static u32    *d_last_words = nullptr;
+        static uint8_t*d_last_len   = nullptr;
+        static int cap = 0;
+        if(batch>cap){
+            if(d_roots)      cudaFree(d_roots);
+            if(d_last_words) cudaFree(d_last_words);
+            if(d_last_len)   cudaFree(d_last_len);
+            cudaMalloc(&d_roots,      batch*32);
+            cudaMalloc(&d_last_words, batch*16*sizeof(u32));
+            cudaMalloc(&d_last_len,   batch);
+            cap=batch;
+        }
 
     int packs=(batch+7)/8;
 
@@ -226,15 +244,18 @@ void blake3_matmul_cuda(const void *d_seeds,size_t seed_len,
     printf("HOST launching root_hash8 batch=%d packs=%d\n", batch, packs);
 
 
-    root_hash8<<<packs,32,0,s>>>(static_cast<const uint8_t*>(d_seeds),
-                                 d_roots,batch);
+        root_hash8<<<packs,32,0,s>>>(static_cast<const uint8_t*>(d_seeds),
+                                     d_roots,
+                                     d_last_words,
+                                     d_last_len,
+                                     batch);
 
     #ifdef DEBUG_TRACE
     {
         uint32_t h_roots[8];
         cudaMemcpy(h_roots, d_roots, sizeof(h_roots), cudaMemcpyDeviceToHost);
-        printf("GPU‑host d_roots[0..3] = %08X %08X %08X %08X\n",
-               h_roots[0], h_roots[1], h_roots[2], h_roots[3]);
+        printf("GPU‑host d_roots[0..7] = %08X %08X %08X %08X %08X %08X %08X %08X\n",
+               h_roots[0], h_roots[1], h_roots[2], h_roots[3], h_roots[4], h_roots[5], h_roots[6], h_roots[7]);
 
         /* --- read the IV directly from constant memory ---------------- */
         uint32_t iv_host[8];
@@ -250,7 +271,12 @@ void blake3_matmul_cuda(const void *d_seeds,size_t seed_len,
     static uint8_t *d_mat=nullptr; static int matcap=0;
     if(batch>matcap){ if(d_mat)cudaFree(d_mat);
                       cudaMalloc(&d_mat,batch*MAT); matcap=batch;}
-    xof_expand<<<grd,blk,0,s>>>(d_roots,d_mat,MAT,batch);
+        xof_expand<<<grd,blk,0,s>>>(d_roots,
+                                    d_last_words,
+                                    d_last_len,
+                                    d_mat,
+                                    MAT,
+                                    batch);
 
     /* GEMM on device – naïve 16×16×k kernel (k=50240) */
     const int ROWS=16,COLS=16,K=50240;

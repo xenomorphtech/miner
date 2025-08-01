@@ -99,7 +99,7 @@ __device__ void g_compress(
     u32 flags,
     u32 *state
 ) {
-    // Search for better alternative
+
     g_memcpy(state, chaining_value, 32);
     g_memcpy(state+8, g_IV, 16);
     state[12] = (u32)counter;
@@ -107,7 +107,17 @@ __device__ void g_compress(
     state[14] = block_len;
     state[15] = flags;
 
+
     GPU_PRINT("init", state);
+
+    #ifdef DEBUG_TRACE
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            printf("GPU INFO counter1   %08X\n", state[12]);
+            printf("GPU INFO counter2   %08X\n", state[13]);
+            printf("GPU INFO block_len  %08X\n", state[14]);
+            printf("GPU INFO flags      %08X\n", state[15]);
+        }
+    #endif
 
 
     u32 block[16];
