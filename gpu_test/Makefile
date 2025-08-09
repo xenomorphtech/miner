@@ -20,33 +20,29 @@ CFLAGS      := -O3 -std=c99 \
 
 LDFLAGS     := -L/usr/local/cuda/lib64 -lcudart -lcudadevrt
 
-# ---------- file lists ----------
-SRC_CUDA        := src/matmul_gpu.cu
-SRC_CPP_COMMON  := src/ref_cpu.cpp
-SRC_CPP_SMOKE   := src/test_smoke.cpp
-SRC_CPP_XOF     := src/test_xof_compare.cpp
-SRC_C           := blake3/c/blake3.c blake3/c/blake3_dispatch.c blake3/c/blake3_portable.c
+# ---------- files ----------
+SRC_CUDA    := src/matmul_gpu.cu
+SRC_CPP     := src/test_smoke.cpp src/ref_cpu.cpp src/test_xof_compare.cpp
+SRC_C       := blake3/c/blake3.c blake3/c/blake3_dispatch.c blake3/c/blake3_portable.c
 
-OBJ_CUDA        := $(SRC_CUDA:.cu=.o)
-OBJ_CPP_COMMON  := $(SRC_CPP_COMMON:.cpp=.o)
-OBJ_CPP_SMOKE   := $(SRC_CPP_SMOKE:.cpp=.o)
-OBJ_CPP_XOF     := $(SRC_CPP_XOF:.cpp=.o)
-OBJ_C           := $(SRC_C:.c=.o)
+OBJ_CUDA    := $(SRC_CUDA:.cu=.o)
+OBJ_CPP     := $(SRC_CPP:.cpp=.o)
+OBJ_C       := $(SRC_C:.c=.o)
 
-OBJS_SMOKE      := $(OBJ_CUDA) $(OBJ_CPP_COMMON) $(OBJ_CPP_SMOKE) $(OBJ_C)
-OBJS_XOF        := $(OBJ_CUDA) $(OBJ_CPP_COMMON) $(OBJ_CPP_XOF)   $(OBJ_C)
+TARGETS     := smoke xof_test
 
-TARGETS := smoke xof_test
-
+# ---------- default target ----------
 .PHONY: all
 all: $(TARGETS)
 
-smoke: $(OBJS_SMOKE)
+# ---------- link ----------
+smoke: src/test_smoke.o src/ref_cpu.o $(OBJ_CUDA) $(OBJ_C)
 	$(NVCC) -arch=$(CUDA_ARCH) -O3 -std=c++17 -rdc=true $^ $(LDFLAGS) -o $@
 
-xof_test: $(OBJS_XOF)
+xof_test: src/test_xof_compare.o $(OBJ_CUDA) $(OBJ_C)
 	$(NVCC) -arch=$(CUDA_ARCH) -O3 -std=c++17 -rdc=true $^ $(LDFLAGS) -o $@
 
+# ---------- compile rules ----------
 %.o: %.cu
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
@@ -56,6 +52,7 @@ xof_test: $(OBJS_XOF)
 %.o: %.c
 	$(CC)   $(CFLAGS)   -c $< -o $@
 
+# ---------- housekeeping ----------
 .PHONY: clean
 clean:
-	rm -f $(OBJS_SMOKE) $(OBJS_XOF) $(TARGETS)
+	rm -f $(OBJ_CUDA) $(OBJ_CPP) $(OBJ_C) $(TARGETS)

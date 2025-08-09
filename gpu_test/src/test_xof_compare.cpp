@@ -2,15 +2,15 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
-#include <string>
-#include <cstdlib>   // strtoul
+#include <cstdlib>      // strtoul
 #include <cuda_runtime.h>
+
 #include "cpu_xof.cpp"
 #include "sanity_vector.cpp"
 
 // GPU helpers
 extern "C" void blake3_xof_cuda(const void*, size_t, void*, size_t, int, cudaStream_t);
-extern "C" void blake3_xof_layout(int counter_offset, int b0_mode);
+extern "C" void blake3_xof_layout(int counter_offset, int b0_mode, int xof_flag_mode);
 
 static void hexdump64(const uint8_t* p) {
     for (int i = 0; i < 64; ++i) {
@@ -18,99 +18,105 @@ static void hexdump64(const uint8_t* p) {
     }
 }
 
-static void hexdump_block(const char* tag, size_t idx, const uint8_t* p) {
-    std::printf("[%s] blk %zu\n", tag, idx);
-    hexdump64(p);
-}
-
 int main(int argc, char** argv) {
-    // CLI: --dump N, --dump-all, --gpu-counter-offset N, --gpu-b0-half <mode>
-    size_t dump_blocks = 0;
-    bool dump_all = false;
-    int gpu_counter_offset = 0;
-    int gpu_b0_mode = 0; // 0=lower,1=upper,2=upper_xor_root,3=lower_xor_root
+    int dump_blocks = 0;     // how many 64-B blocks to print
+    int counter_off = 0;
+    int b0_mode     = 0;     // 0=spec hi^precv (default)
+    int flag_mode   = 0;     // 0=ROOT (spec), 1=DERIVE (debug)
+    enum class SeedKind { A, Zero } seed_kind = SeedKind::A;
 
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if (a == "--dump" && i+1 < argc) {
-            dump_blocks = std::strtoul(argv[++i], nullptr, 10);
-        } else if (a == "--dump-all") {
-            dump_all = true;
-        } else if (a == "--gpu-counter-offset" && i+1 < argc) {
-            gpu_counter_offset = int(std::strtol(argv[++i], nullptr, 10));
-        } else if (a == "--gpu-b0-half" && i+1 < argc) {
-            std::string m = argv[++i];
-            if      (m == "lower")          gpu_b0_mode = 0;
-            else if (m == "upper")          gpu_b0_mode = 1;
-            else if (m == "upper_xor_root") gpu_b0_mode = 2;
-            else if (m == "lower_xor_root") gpu_b0_mode = 3;
-            else {
-                std::fprintf(stderr, "Unknown --gpu-b0-half mode: %s\n", m.c_str());
-                return 2;
-            }
-        } else {
-            std::fprintf(stderr,
-                "Usage: %s [--dump N|--dump-all] [--gpu-counter-offset N] "
-                "[--gpu-b0-half lower|upper|upper_xor_root|lower_xor_root]\n",
-                argv[0]);
-            return 2;
+    // CLI
+    for (int i=1; i<argc; ++i) {
+        if (!std::strcmp(argv[i], "--dump") && i+1 < argc) {
+            dump_blocks = (int)std::strtoul(argv[++i], nullptr, 10);
+        } else if (!std::strcmp(argv[i], "--gpu-counter-offset") && i+1 < argc) {
+            counter_off = (int)std::strtoul(argv[++i], nullptr, 10);
+        } else if (!std::strcmp(argv[i], "--gpu-b0-half") && i+1 < argc) {
+            const char* s = argv[++i];
+            if      (!std::strcmp(s,"spec"))             b0_mode = 0;
+            else if (!std::strcmp(s,"tmpL"))             b0_mode = 1;
+            else if (!std::strcmp(s,"tmpH"))             b0_mode = 2;
+            else if (!std::strcmp(s,"rootcmpL"))         b0_mode = 3;
+            else if (!std::strcmp(s,"rootcmpH"))         b0_mode = 4;
+            else if (!std::strcmp(s,"rootcmpH_xor_cv"))  b0_mode = 5;
+            else b0_mode = 0;
+        } else if (!std::strcmp(argv[i], "--gpu-xof-flags") && i+1 < argc) {
+            const char* s = argv[++i];
+            flag_mode = (!std::strcmp(s,"derive") ? 1 : 0);
+        } else if (!std::strcmp(argv[i], "--seed") && i+1 < argc) {
+            const char* s = argv[++i];
+            if (!std::strcmp(s,"zero") || !std::strcmp(s,"zeros"))
+                seed_kind = SeedKind::Zero;
+            else
+                seed_kind = SeedKind::A; // default
         }
     }
-
-    // Program the GPU layout (counter offset + blk0 second half wiring)
-    blake3_xof_layout(gpu_counter_offset, gpu_b0_mode);
+    blake3_xof_layout(counter_off, b0_mode, flag_mode);
 
     const int BATCH = 1;
-    // Seed = "a" × 240
-    std::vector<uint8_t> h_seeds(BATCH * 240, 'a');
+    const size_t SEEDLEN = 240;
+    const size_t MAT = 1'607'680; // 25,120 * 64
+
+    // Seed buffer
+    std::vector<uint8_t> h_seeds(BATCH * SEEDLEN);
+    if (seed_kind == SeedKind::A) {
+        std::fill(h_seeds.begin(), h_seeds.end(), (uint8_t)'a');
+        std::puts("[seed] using 'a' × 240");
+    } else {
+        std::fill(h_seeds.begin(), h_seeds.end(), (uint8_t)0);
+        std::puts("[seed] using 0x00 × 240");
+    }
 
     // --- CPU XOF ---
     std::vector<uint8_t> xof_cpu;
     blake3_xof_cpu(h_seeds.data(), xof_cpu);
 
-    // Sanity: check the first 64 bytes vs Elixir result
-    if (std::memcmp(xof_cpu.data(), ELIXIR_Ax240_FIRST64, 64) != 0) {
-        std::puts("❌ CPU XOF[0..63] != Elixir expected");
-        std::puts("--- CPU ---"); hexdump64(xof_cpu.data());
-        std::puts("--- EXP ---"); hexdump64(ELIXIR_Ax240_FIRST64);
-        return 1;
+    // Optional Elixir sanity only for 'a'×240 (we have a known first64 vector)
+    if (seed_kind == SeedKind::A) {
+        if (std::memcmp(xof_cpu.data(), ELIXIR_Ax240_FIRST64, 64) != 0) {
+            std::puts("❌ CPU XOF[0..63] != Elixir expected");
+            std::puts("--- CPU ---"); hexdump64(xof_cpu.data());
+            std::puts("--- EXP ---"); hexdump64(ELIXIR_Ax240_FIRST64);
+            return 1;
+        } else {
+            std::puts("✅ CPU XOF[0..63] matches Elixir.");
+        }
     } else {
-        std::puts("✅ CPU XOF[0..63] matches Elixir.");
+        // For zeros there’s no Elixir vector baked in; just show the CPU first64
+        std::puts("[info] CPU first 64 bytes (zeros seed):");
+        hexdump64(xof_cpu.data());
     }
 
     // --- GPU XOF ---
-    constexpr size_t MAT = 1'607'680;
     uint8_t *d_seeds = nullptr, *d_xof = nullptr;
     cudaMalloc(&d_seeds, h_seeds.size());
     cudaMemcpy(d_seeds, h_seeds.data(), h_seeds.size(), cudaMemcpyHostToDevice);
 
     cudaMalloc(&d_xof, MAT);
-    blake3_xof_cuda(d_seeds, 240, d_xof, MAT, BATCH, 0);
+    blake3_xof_cuda(d_seeds, SEEDLEN, d_xof, MAT, BATCH, 0);
     cudaDeviceSynchronize();
 
     std::vector<uint8_t> xof_gpu(MAT);
     cudaMemcpy(xof_gpu.data(), d_xof, MAT, cudaMemcpyDeviceToHost);
 
-    // Optional dumps:
-    const size_t BLOCKS = MAT / 64;
-    if (dump_all) {
-        for (size_t b = 0; b < BLOCKS; ++b) {
-            hexdump_block("CPU", b, &xof_cpu[b*64]);
-            hexdump_block("GPU", b, &xof_gpu[b*64]);
-        }
-    } else if (dump_blocks) {
-        for (size_t b = 0; b < dump_blocks && b < BLOCKS; ++b) {
-            hexdump_block("CPU", b, &xof_cpu[b*64]);
-            hexdump_block("GPU", b, &xof_gpu[b*64]);
-        }
+    // Print blk0 from both sides
+    if (dump_blocks > 0) {
+        std::puts("[blk0 sanity]");
+        std::puts("--- CPU ---"); hexdump64(&xof_cpu[0]);
+        std::puts("--- GPU ---"); hexdump64(&xof_gpu[0]);
     }
 
-    // --- Compare all blocks (25,120 × 64 B) ---
-    size_t first_mismatch = BLOCKS; // sentinel
+    // Compare all blocks
+    const size_t BLOCKS = MAT / 64;
+    size_t first_mismatch = BLOCKS;
     for (size_t b = 0; b < BLOCKS; ++b) {
         if (std::memcmp(&xof_cpu[b*64], &xof_gpu[b*64], 64) != 0) {
             first_mismatch = b;
             break;
+        }
+        if (dump_blocks > (int)b) {
+            std::printf("[CPU] blk %zu\n", b); hexdump64(&xof_cpu[b*64]);
+            std::printf("[GPU] blk %zu\n", b); hexdump64(&xof_gpu[b*64]);
         }
     }
 
@@ -121,14 +127,6 @@ int main(int argc, char** argv) {
                     first_mismatch, first_mismatch*64);
         std::puts("--- CPU ---"); hexdump64(&xof_cpu[first_mismatch*64]);
         std::puts("--- GPU ---"); hexdump64(&xof_gpu[first_mismatch*64]);
-
-        // Also show blk0 to compare starting point unconditionally
-        std::puts("\n[blk0 sanity]");
-        std::puts("--- CPU ---"); hexdump64(&xof_cpu[0]);
-        std::puts("--- GPU ---"); hexdump64(&xof_gpu[0]);
-        cudaFree(d_seeds);
-        cudaFree(d_xof);
-        return 2;
     }
 
     cudaFree(d_seeds);
