@@ -1,19 +1,20 @@
 #include "blaze3_cpu.cuh"
 
-#include <stdio.h>         /* printf inside device code */
+#include <stdio.h>         
+#include <stdint.h>
 
 /* ============ helpers for optional tracing ===================== */
 
-#ifdef DEBUG_TRACE
-#define GPU_PRINT(tag, st)                                               \
-    do {                                                                 \
-        if (threadIdx.x == 0 && blockIdx.x == 0) {                       \
-            printf("GPU STATE %-5s %08X %08X %08X %08X\n", tag,                \
-                   (st)[0], (st)[1], (st)[2], (st)[3]);                  \
-        }                                                                \
-    } while (0)
+#if defined(DEBUG_TRACE) && defined(__CUDACC__)
+  #define GPU_PRINT(tag, st)                                               \
+      do {                                                                 \
+          if (threadIdx.x == 0 && blockIdx.x == 0) {                       \
+              printf("GPU STATE %-5s %08X %08X %08X %08X\n", tag,          \
+                     (st)[0], (st)[1], (st)[2], (st)[3]);                  \
+          }                                                                \
+      } while (0)
 #else
-#define GPU_PRINT(tag, st)  ((void)0)
+  #define GPU_PRINT(tag, st)  ((void)0)
 #endif
 
 // Number of threads per thread block
@@ -151,9 +152,8 @@ __device__ void g_compress(
     GPU_PRINT("r7", state);
 
 
-    for(int i=0; i<8; i++){
+    for(int i = 0; i < 8; i++){
         state[i] ^= state[i + 8];
-        state[i + 8] ^= chaining_value[i];
     }
 
     GPU_PRINT("final", state);
