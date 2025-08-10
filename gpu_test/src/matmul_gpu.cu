@@ -104,30 +104,7 @@ __global__ void xof_expand(const u32* __restrict__ d_roots,
     #pragma unroll
     for (int w=0; w<8; ++w) dstw[w] = out[w];
 
-    // Upper 32B selection (debug modes for blk0; otherwise spec)
-    if (blk == 0) {
-        if      (g_xof_layout.b0_mode == 1) { // tmpL
-            #pragma unroll
-            for (int w=0; w<8; ++w) dstw[w+8] = out[w];
-            return;
-        } else if (g_xof_layout.b0_mode == 2) { // tmpH
-            #pragma unroll
-            for (int w=0; w<8; ++w) dstw[w+8] = out[w+8];
-            return;
-        } else if (g_xof_layout.b0_mode == 3) { // rootcmpL
-            #pragma unroll
-            for (int w=0; w<8; ++w) dstw[w+8] = out[w];
-            return;
-        } else if (g_xof_layout.b0_mode == 4) { // rootcmpH
-            #pragma unroll
-            for (int w=0; w<8; ++w) dstw[w+8] = out[w+8];
-            return;
-        } else if (g_xof_layout.b0_mode == 5) { // rootcmpH ^ precv  (spec upper)
-            #pragma unroll
-            for (int w=0; w<8; ++w) dstw[w+8] = out[w+8] ^ precv[w];
-            return;
-        }
-    }
+
 
     // Default/spec upper: hi ^ precv
     #pragma unroll
