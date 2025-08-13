@@ -2,7 +2,9 @@ CUDA_ARCH   := sm_89
 
 NVCC        := nvcc
 NVCCFLAGS   := -arch=$(CUDA_ARCH) -O3 -std=c++17 -rdc=true \
-               -Iinclude -Iblake3 -Iblake3/c -DDEBUG_TRACE
+               -Iinclude -Iblake3 -Iblake3/c 
+
+#-DDEBUG_TRACE
 
 CXX         := g++
 CUDA_PATH   ?= /usr/local/cuda

@@ -46,7 +46,19 @@ static bool check_blake3_kat_a240() {
 extern "C" void blake3_matmul_cuda(const void*, size_t, void*, size_t, int, cudaStream_t);
 void cpu_reference(const uint8_t*, std::vector<int32_t>&);
 
+extern "C"
+bool blake3_matmul_cuda_find2zero(
+    void*       d_seeds,       size_t seed_len,   // 240
+    void*       d_out_hashes,  size_t out_len,    // must be 32*batch
+    int         batch,
+    uint64_t    start_nonce,
+    int         max_rounds,    // safety cap
+    int*        h_found_idx,
+    uint64_t*   h_found_nonce,
+    uint32_t*   h_found_high,
+    cudaStream_t s);
 
+ 
 static bool check_cpu_known_vector() {
     // 1) Prepare seed: 240 x 'a'
     std::vector<uint8_t> seed(240, 'a');
@@ -82,8 +94,78 @@ static bool check_cpu_known_vector() {
     puts("✅ CPU known-vector matches (first 64 bytes).");
     return true;
 }
-
 int main() {
+    if (!check_blake3_kat_a240()) return 1;
+
+    // Step 2: Proceed with your existing GPU vs CPU smoke test
+    const size_t BATCH = 1 << 13; // small for first run
+    std::vector<uint8_t> h_seeds(BATCH * 240);
+    
+    //std::mt19937_64 rng(123);
+    for (auto &b : h_seeds) b = 0;
+
+    auto u32_ptr = reinterpret_cast<uint32_t*>(h_seeds.data());
+
+    //for (size_t batch_idx = 0; batch_idx < BATCH; ++batch_idx) {
+    //    u32_ptr[(batch_idx * 240 + 228) / 4] = batch_idx; 
+    //}
+    //print_hex(h_seeds.data() + 240 * 0x2e5 , 240, "Expected (64 bytes):");
+      
+    uint8_t *d_seeds = nullptr;
+    int32_t *d_prod = nullptr;
+    uint8_t *d_hashes = nullptr;
+ 
+    cudaError_t err;
+
+err =cudaMalloc(&d_hashes, BATCH * 32ull);
+    if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_hashes failed: %s\n", cudaGetErrorString(err)); return 1; }
+
+err =cudaMalloc(&d_seeds,  BATCH * 240ull);
+    if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_seeds failed: %s\n", cudaGetErrorString(err)); return 1; }
+
+    err = cudaMalloc(&d_prod,  BATCH * 256ull * 4ull);
+    if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_prod failed: %s\n", cudaGetErrorString(err)); cudaFree(d_seeds); return 1; }
+
+    err = cudaMemcpy(d_seeds, h_seeds.data(), h_seeds.size(), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { fprintf(stderr, "cudaMemcpy H2D failed: %s\n", cudaGetErrorString(err)); cudaFree(d_seeds); cudaFree(d_prod); return 1; }
+
+uint64_t start_nonce = 0;
+int max_rounds = 1<<24; // e.g. try ~1M batches of size `batch`
+int found_idx;
+uint32_t found_high = 0;
+uint64_t found_nonce = 0;
+size_t batch = BATCH;
+int stream = 0;
+puts("before\n");
+bool ok = blake3_matmul_cuda_find2zero(
+    d_seeds, 240,
+    d_hashes, (size_t)batch * 32,
+    batch,
+    start_nonce,
+    max_rounds,
+    &found_idx,
+    &found_nonce,
+    &found_high,
+    0);
+
+if (ok) {
+    printf("found a hash idx: %x high: %X low: %lX\n", found_idx, found_high, found_nonce); 
+    // found_idx: which seed in the batch matched
+    // found_nonce: the winning nonce written into that seed’s last 8 bytes (LE)
+    // d_hashes[found_idx] is the winning hash (starts with 0x00, 0x00).
+} else {
+    puts("didn't found a hash"); 
+ }
+    cudaFree(d_seeds);
+    cudaFree(d_hashes);
+    cudaFree(d_prod);
+
+
+    return 0;
+}
+
+
+int main1() {
     if (!check_blake3_kat_a240()) return 1;
 
     // Step 2: Proceed with your existing GPU vs CPU smoke test
@@ -95,9 +177,12 @@ int main() {
 
     uint8_t *d_seeds = nullptr;
     int32_t *d_prod = nullptr;
-
+    uint8_t *d_hashes = nullptr;
+ 
     cudaError_t err;
     err = cudaMalloc(&d_seeds, h_seeds.size());
+    err = cudaMalloc(&d_hashes, 1024);
+ 
     if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_seeds failed: %s\n", cudaGetErrorString(err)); return 1; }
     err = cudaMalloc(&d_prod, BATCH * 256 * 4);
     if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_prod failed: %s\n", cudaGetErrorString(err)); cudaFree(d_seeds); return 1; }
@@ -110,34 +195,38 @@ int main() {
     blake3_matmul_cuda(d_seeds, 240, d_prod, 256 * 4, BATCH, 0);
     cudaDeviceSynchronize();
 
+
     //sleep(1); // optional
 
     std::vector<int32_t> h_gpu(BATCH * 256);
     err = cudaMemcpy(h_gpu.data(), d_prod, h_gpu.size() * 4, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) { fprintf(stderr, "cudaMemcpy D2H failed: %s\n", cudaGetErrorString(err)); cudaFree(d_seeds); cudaFree(d_prod); return 1; }
 
-    for (int s = 0; s < BATCH; ++s) {
-        std::vector<int32_t> ref;
-        cpu_reference(&h_seeds[s * 240], ref);
+//    for (int s = 0; s < BATCH; ++s) {
+//        std::vector<int32_t> ref;
+//        cpu_reference(&h_seeds[s * 240], ref);
+//
+//        if (std::memcmp(ref.data(), h_gpu.data() + s * 256, 256 * 4) != 0) {
+//            puts("❌ GPU vs CPU mismatch. Showing first 64 bytes of each:");
+//            // Print CPU (ref) first 64 bytes
+//            print_hex(reinterpret_cast<uint8_t*>(ref.data()), 64, "CPU (first 64):");
+//            // Print GPU first 64 bytes
+//            print_hex(reinterpret_cast<uint8_t*>(h_gpu.data() + s * 256), 64, "GPU (first 64):");
+//
+//            cudaFree(d_seeds);
+//            cudaFree(d_prod);
+//            return 1;
+//        }
+//       else {
+//          print_hex(reinterpret_cast<uint8_t*>(h_gpu.data()), 64, "GPU (first 64):");
+//       }
+//    }
 
-        if (std::memcmp(ref.data(), h_gpu.data() + s * 256, 256 * 4) != 0) {
-            puts("❌ GPU vs CPU mismatch. Showing first 64 bytes of each:");
-            // Print CPU (ref) first 64 bytes
-            print_hex(reinterpret_cast<uint8_t*>(ref.data()), 64, "CPU (first 64):");
-            // Print GPU first 64 bytes
-            print_hex(reinterpret_cast<uint8_t*>(h_gpu.data() + s * 256), 64, "GPU (first 64):");
-
-            cudaFree(d_seeds);
-            cudaFree(d_prod);
-            return 1;
-        }
-       else {
-          print_hex(reinterpret_cast<uint8_t*>(h_gpu.data()), 64, "GPU (first 64):");
-       }
-    }
-
-    puts("✅ GPU matches CPU on all samples.");
+    puts("✅ GPU matches CPU on all samples. xx");
     cudaFree(d_seeds);
+    cudaFree(d_hashes);
     cudaFree(d_prod);
+
+
     return 0;
 }

@@ -495,3 +495,240 @@ void blake3_matmul_cuda(const void *d_seeds, size_t seed_len,
         static_cast<uint8_t*>(d_out),
         batch);
 }
+
+// --- helpers: write per-seed nonces into the last 8B (LE) of each seed ----
+__device__ inline void store_u64_le(uint8_t* p, uint64_t x) {
+    #pragma unroll
+    for (int i=0; i<8; ++i) p[i] = (uint8_t)((x >> (8*i)) & 0xFF);
+}
+
+__global__ void write_nonces_tail_le(
+    uint8_t* __restrict__ d_seeds,  // 240B per item (will be modified in-place)
+    int batch,
+    uint64_t start_nonce,
+    uint64_t round,                  // round index
+    uint64_t batch_stride            // usually == batch
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch) return;
+    const uint64_t nonce = start_nonce + round*batch_stride + (uint64_t)idx;
+
+    uint8_t* seed_tail = d_seeds + (size_t)idx*240 + 232; // last 8 bytes
+    store_u64_le(seed_tail, nonce);
+}
+
+// --- check: does hash start with two 0x00 bytes? set the first global winner ---
+__global__ void find_first_two_zeroes(
+    const uint8_t* __restrict__ d_hash32, // 32B per item
+    const uint8_t* __restrict__ d_seeds,  // to re-read fields for the winner
+    int batch,
+    int*       __restrict__ d_found_idx,        // -1 if none yet
+    uint64_t*  __restrict__ d_found_nonce,      // still reporting nonce
+    uint32_t*  __restrict__ d_found_u32_at_228  // NEW: the u32 at offset 228
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch) return;
+
+    const uint8_t* h = d_hash32 + (size_t)idx * 32;
+    if ((h[0] == 0x00) && (h[1] == 0x00) && (h[2] == 0x00)) {
+        // claim "first"
+        int old = atomicCAS(d_found_idx, -1, idx);
+        if (old == -1) {
+            // read nonce (LE) from seed tail [232..239]
+            const uint8_t* tail = d_seeds + (size_t)idx*240 + 232;
+            uint64_t n = 0;
+            #pragma unroll
+            for (int i=0;i<8;++i) n |= ((uint64_t)tail[i]) << (8*i);
+            *d_found_nonce = n;
+
+            // read u32 at byte offset 228 (aligned)
+            const uint32_t* p228 =
+                reinterpret_cast<const uint32_t*>(d_seeds + (size_t)idx*240 + 228);
+            *d_found_u32_at_228 = *p228;
+        }
+    }
+}
+// Searches for the first hash (of seed||C) that starts with two 0x00 bytes.
+// Assumptions:
+// - Nonce is stored LE in seed bytes [232..239] (last 8 bytes).
+// - We iterate nonces as: start_nonce + round*batch + idx.
+// Returns true if found; sets *h_found_idx (0..batch-1) and *h_found_nonce.
+extern "C"
+bool blake3_matmul_cuda_find2zero(
+    void*       d_seeds,       size_t seed_len,   // 240
+    void*       d_out_hashes,  size_t out_len,    // must be 32*batch
+    int         batch,
+    uint64_t    start_nonce,
+    int         max_rounds,    // safety cap
+    int*        h_found_idx,
+    uint64_t*   h_found_nonce,
+    uint32_t*   h_found_u32_at_228,
+    cudaStream_t s)
+{
+    constexpr size_t SEED = 240;
+    if (seed_len != SEED || batch <= 0) return false;
+    if (out_len != (size_t)batch * 32) return false;
+
+    // device-side found flags
+    int *d_found_idx = nullptr;
+    uint64_t *d_found_nonce = nullptr;
+    uint32_t *d_found_u32_at_228 = nullptr;
+                                            
+    cudaMalloc(&d_found_idx, sizeof(int));
+    cudaMalloc(&d_found_nonce, sizeof(uint64_t));
+    cudaMalloc(&d_found_u32_at_228, sizeof(uint32_t));
+
+    auto reset_found = [&]() {
+        int init = -1;
+        uint64_t z = 0;
+        cudaMemcpyAsync(d_found_idx, &init, sizeof(int), cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(d_found_nonce, &z, sizeof(uint64_t), cudaMemcpyHostToDevice, s);
+     };
+
+    // Scratch hash buffer is the user's d_out_hashes (32B * batch)
+    // We reuse your existing internal scratch from blake3_matmul_cuda path:
+    // d_ab, d_C, d_roots, d_precv, d_last_words, d_last_len etc.
+    // We'll replicate the pipeline with nonce write + compute + check in a loop.
+
+    // Internal constants matching your existing code:
+    constexpr size_t A_BYTES  = 16ull * 50240ull;
+    constexpr size_t B_BYTES  = 16ull * 50240ull;
+    constexpr size_t AB_BYTES = A_BYTES + B_BYTES;
+    constexpr size_t C_BYTES  = 16ull * 16ull * 4ull;
+
+    // ---- grow-once scratch (mirroring your function) ----
+    static uint8_t* d_ab = nullptr;   // A||B per seed
+    static int32_t* d_C  = nullptr;   // 16x16 i32 per seed
+    static int cap = 0;
+
+    if (batch > cap) {
+        if (d_ab) cudaFree(d_ab);
+        if (d_C)  cudaFree(d_C);
+        cudaMalloc(&d_ab, (size_t)batch * AB_BYTES);
+        cudaMalloc(&d_C,  (size_t)batch * C_BYTES);
+        cap = batch;
+    }
+
+    static u32     *d_roots      = nullptr;
+    static u32     *d_precv      = nullptr;
+    static u32     *d_last_words = nullptr;
+    static uint8_t *d_last_len   = nullptr;
+    static int cap2 = 0;
+    if (batch > cap2) {
+        if (d_roots)      cudaFree(d_roots);
+        if (d_precv)      cudaFree(d_precv);
+        if (d_last_words) cudaFree(d_last_words);
+        if (d_last_len)   cudaFree(d_last_len);
+        cudaMalloc(&d_roots,      (size_t)batch * 8 * sizeof(u32));
+        cudaMalloc(&d_precv,      (size_t)batch * 8 * sizeof(u32));
+        cudaMalloc(&d_last_words, (size_t)batch * 16 * sizeof(u32));
+        cudaMalloc(&d_last_len,   (size_t)batch * sizeof(uint8_t));
+        cap2 = batch;
+    }
+
+    // Kernel launch shapes
+    const int threads = 256;
+    const int blocksB = (batch + threads - 1) / threads;
+
+    // XOF expansion grid (same as your code)
+    const uint64_t blocks  = 25120ULL;
+    const uint64_t threads_total = (uint64_t)batch * blocks;
+    dim3 xof_blk(256), xof_grd((threads_total + 255) / 256);
+
+    // GEMM launch
+    dim3 gemm_blk(16, 16, 1);
+    dim3 gemm_grd(batch, 1, 1);
+
+    // ---- rounds loop ----
+    bool found = false;
+    *h_found_idx   = -1;
+    *h_found_nonce = 0;
+    *h_found_u32_at_228  = 0;
+
+    reset_found();
+
+cudaEvent_t start, stop;
+cudaEventCreate(&start);
+cudaEventCreate(&stop);
+
+    for (int round = 0; round < max_rounds; ++round) {
+
+        cudaEventRecord(start, s);
+
+        // 0) Write nonces for this round into seeds tail (in-place)
+        write_nonces_tail_le<<<blocksB, threads, 0, s>>>(
+            static_cast<uint8_t*>(d_seeds),
+            batch,
+            start_nonce,
+            (uint64_t)round,
+            (uint64_t)batch
+        );
+
+        // 1) Build roots/final-leaf for XOF
+        {
+            int packs = (batch + 7) / 8;
+            root_hash8<<<packs, 32, 0, s>>>(
+                static_cast<const uint8_t*>(d_seeds),
+                d_roots, d_precv, d_last_words, d_last_len, batch);
+        }
+
+        // 2) XOF expand -> A||B
+        xof_expand<<<xof_grd, xof_blk, 0, s>>>(
+            d_roots, d_precv, d_last_words, d_last_len,
+            d_ab, AB_BYTES, batch);
+
+        // 3) GEMM C = A * B
+        matmul16x50240_u8_i8<<<gemm_grd, gemm_blk, 0, s>>>(d_ab, AB_BYTES, d_C, batch);
+
+        // 4) Hash seed||C -> 32B
+        blake3_hash_seed_plus_c<<<blocksB, threads, 0, s>>>(
+            static_cast<const uint8_t*>(d_seeds),
+            d_C,
+            static_cast<uint8_t*>(d_out_hashes),
+            batch);
+
+        // 5) Check for two leading zero bytes, claim first
+        find_first_two_zeroes<<<blocksB, threads, 0, s>>>(
+            static_cast<const uint8_t*>(d_out_hashes),
+            static_cast<const uint8_t*>(d_seeds),
+            batch,
+            d_found_idx,
+            d_found_nonce,
+            d_found_u32_at_228
+        );
+
+
+        cudaEventRecord(stop, s);
+        cudaEventSynchronize(stop);
+
+        float ms_round = 0.0f;
+        cudaEventElapsedTime(&ms_round, start, stop);
+
+        double hps = (double)batch / (ms_round / 1000.0);
+        printf("Round %d: %.2f MH/s\n", round, hps / 1e6);
+
+        // Pull flag to host
+        int h_idx = -1;
+        cudaMemcpyAsync(&h_idx, d_found_idx, sizeof(int), cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+
+
+        if (h_idx != -1) {
+            uint64_t h_nonce = 0;
+            uint32_t h_u32_228 = 0;
+            cudaMemcpy(&h_nonce, d_found_nonce, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+            cudaMemcpy(&h_u32_228, d_found_u32_at_228, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+            *h_found_idx   = h_idx;
+            *h_found_nonce = h_nonce;
+            *h_found_u32_at_228 = h_u32_228;
+            found = true;
+            break;
+        }
+        // else continue next round with new nonces
+    }
+
+    cudaFree(d_found_idx);
+    cudaFree(d_found_nonce);
+    return found;
+}
