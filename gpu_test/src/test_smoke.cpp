@@ -90,8 +90,8 @@ int main() {
     const int BATCH = 1; // small for first run
     std::vector<uint8_t> h_seeds(BATCH * 240);
 
-    std::mt19937_64 rng(123);
-    for (auto &b : h_seeds) b = rng() & 0xFF;
+    //std::mt19937_64 rng(123);
+    for (auto &b : h_seeds) b = 0;
 
     uint8_t *d_seeds = nullptr;
     int32_t *d_prod = nullptr;
@@ -105,10 +105,12 @@ int main() {
     err = cudaMemcpy(d_seeds, h_seeds.data(), h_seeds.size(), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) { fprintf(stderr, "cudaMemcpy H2D failed: %s\n", cudaGetErrorString(err)); cudaFree(d_seeds); cudaFree(d_prod); return 1; }
 
+    fprintf(stderr, "blake3_matmul_cuda\n");
+
     blake3_matmul_cuda(d_seeds, 240, d_prod, 256 * 4, BATCH, 0);
     cudaDeviceSynchronize();
 
-    sleep(1); // optional
+    //sleep(1); // optional
 
     std::vector<int32_t> h_gpu(BATCH * 256);
     err = cudaMemcpy(h_gpu.data(), d_prod, h_gpu.size() * 4, cudaMemcpyDeviceToHost);
@@ -129,6 +131,9 @@ int main() {
             cudaFree(d_prod);
             return 1;
         }
+       else {
+          print_hex(reinterpret_cast<uint8_t*>(h_gpu.data()), 64, "GPU (first 64):");
+       }
     }
 
     puts("✅ GPU matches CPU on all samples.");

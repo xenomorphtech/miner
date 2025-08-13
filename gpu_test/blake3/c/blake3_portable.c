@@ -83,28 +83,28 @@ INLINE void compress_pre(uint32_t state[16], const uint32_t cv[8],
   state[14] = (uint32_t)block_len;
   state[15] = (uint32_t)flags;
 
-  CPU_PRINT_STATE("init", state);
+  //CPU_PRINT_STATE("init", state);
 
 
-  printf("CPU INFO counter1   %08X\n", state[12]);
-  printf("CPU INFO counter2   %08X\n", state[13]);
-  printf("CPU INFO block_len  %08X\n", state[14]);
-  printf("CPU INFO flags      %08X\n", state[15]);
+  //printf("CPU INFO counter1   %08X\n", state[12]);
+  //printf("CPU INFO counter2   %08X\n", state[13]);
+  //printf("CPU INFO block_len  %08X\n", state[14]);
+  //printf("CPU INFO flags      %08X\n", state[15]);
 
   round_fn(state, &block_words[0], 0);
-  CPU_PRINT_STATE("r1", state);
+  //CPU_PRINT_STATE("r1", state);
   round_fn(state, &block_words[0], 1);
-  CPU_PRINT_STATE("r2", state);
+  //CPU_PRINT_STATE("r2", state);
   round_fn(state, &block_words[0], 2);
-  CPU_PRINT_STATE("r3", state);
+  //CPU_PRINT_STATE("r3", state);
   round_fn(state, &block_words[0], 3);
-  CPU_PRINT_STATE("r4", state);
+  //CPU_PRINT_STATE("r4", state);
   round_fn(state, &block_words[0], 4);
-  CPU_PRINT_STATE("r5", state);
+  //CPU_PRINT_STATE("r5", state);
   round_fn(state, &block_words[0], 5);
-  CPU_PRINT_STATE("r6", state);
+  //CPU_PRINT_STATE("r6", state);
   round_fn(state, &block_words[0], 6);
-  CPU_PRINT_STATE("r7", state);
+  //CPU_PRINT_STATE("r7", state);
 }
 
 void blake3_compress_in_place_portable(uint32_t cv[8],
@@ -131,8 +131,8 @@ void blake3_compress_xof_portable(const uint32_t cv[8],
                                   uint8_t block_len, uint64_t counter,
                                   uint8_t flags, uint8_t out[64]) {
 
-  printf("CPU‑XOF  counter=%llu  flags=%02X\n",
-    (unsigned long long)counter, flags);
+  //printf("CPU‑XOF  counter=%llu  flags=%02X\n",
+  //  (unsigned long long)counter, flags);
 
   uint32_t state[16];
   compress_pre(state, cv, block, block_len, counter, flags);

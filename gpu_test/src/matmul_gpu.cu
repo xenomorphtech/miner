@@ -104,7 +104,30 @@ __global__ void xof_expand(const u32* __restrict__ d_roots,
     #pragma unroll
     for (int w=0; w<8; ++w) dstw[w] = out[w];
 
-
+    // Upper 32B selection (debug modes for blk0; otherwise spec)
+    if (blk == 0) {
+        if      (g_xof_layout.b0_mode == 1) { // tmpL
+            #pragma unroll
+            for (int w=0; w<8; ++w) dstw[w+8] = out[w];
+            return;
+        } else if (g_xof_layout.b0_mode == 2) { // tmpH
+            #pragma unroll
+            for (int w=0; w<8; ++w) dstw[w+8] = out[w+8];
+            return;
+        } else if (g_xof_layout.b0_mode == 3) { // rootcmpL
+            #pragma unroll
+            for (int w=0; w<8; ++w) dstw[w+8] = out[w];
+            return;
+        } else if (g_xof_layout.b0_mode == 4) { // rootcmpH
+            #pragma unroll
+            for (int w=0; w<8; ++w) dstw[w+8] = out[w+8];
+            return;
+        } else if (g_xof_layout.b0_mode == 5) { // rootcmpH ^ precv  (spec upper)
+            #pragma unroll
+            for (int w=0; w<8; ++w) dstw[w+8] = out[w+8] ^ precv[w];
+            return;
+        }
+    }
 
     // Default/spec upper: hi ^ precv
     #pragma unroll
@@ -221,11 +244,254 @@ void blake3_xof_cuda(const void *d_seeds, size_t seed_len,
         MAT_BYTES, batch);
 }
 
-/* keep a stub so test_smoke links, but do nothing here */
+// --- GEMM: C16x16 = A(16x50240, u8) * B(50240x16, i8) -----------------
+__global__ void matmul16x50240_u8_i8(
+    const uint8_t* __restrict__ d_ab,  // A||B per seed (1,607,680 bytes)
+    size_t per_ab,
+    int32_t* __restrict__ d_C,         // 16*16 i32 per seed (256 i32)
+    int batch)
+{
+    // 2D thread: (i,j) in 16x16 tile, one block per seed
+    const int i = threadIdx.y; // 0..15
+    const int j = threadIdx.x; // 0..15
+    const int seed = blockIdx.x;
+    if (seed >= batch || i >= 16 || j >= 16) return;
+
+    const size_t A_BYTES = 16ull * 50240ull; // 803,840
+    const size_t B_BYTES = 16ull * 50240ull; // 803,840
+    const uint8_t* base = d_ab + (size_t)seed * per_ab;
+
+    const uint8_t* A = base;                 // row-major u8 [16 x 50240]
+    const uint8_t* B = base + A_BYTES;       // row-major u8 [50240 x 16] (to be read as i8)
+
+    int32_t acc = 0;
+    const int K = 50240;
+
+    // Row i of A, Column j of B (note B is row-major: B[k*16 + j])
+    const size_t rowA = (size_t)i * K;
+
+    #pragma unroll 4
+    for (int k = 0; k < K; ++k) {
+        const int32_t a = (int32_t)A[rowA + k];              // u8 -> i32
+        const int32_t b = (int32_t)((int8_t)B[(size_t)k*16 + j]); // u8 reinterpreted as i8 -> i32
+        acc += a * b;
+    }
+
+    d_C[(size_t)seed * 256 + (size_t)i * 16 + j] = acc;
+}
+
+// --- BLAKE3 hash (single chunk, 1024B) of C (16x16 i32) ----------------
+__global__ void blake3_hash_c1024(
+    const int32_t* __restrict__ d_C,  // 256 i32 per seed
+    uint8_t* __restrict__ d_out32,    // 32B per seed
+    int batch)
+{
+    const int seed = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seed >= batch) return;
+
+    // CV starts from IV
+    u32 cv[8];
+    #pragma unroll
+    for (int w = 0; w < 8; ++w) cv[w] = g_IV[w];
+
+    // Process exactly 16 blocks (16 * 64B = 1024B)
+    const u32* data = reinterpret_cast<const u32*>(d_C + (size_t)seed * 256);
+    u32 tmp_state[16];
+
+    for (int blk = 0; blk < 16; ++blk) {
+        u32 m[16];
+        #pragma unroll
+        for (int w = 0; w < 16; ++w) m[w] = data[blk*16 + w];
+
+        u32 flags = 0;
+        if (blk == 0)  flags |= CHUNK_START;
+        if (blk == 15) flags |= (CHUNK_END | ROOT);
+
+        g_compress(cv, m, 0ULL, 64u, flags, tmp_state);
+
+        // Next CV = low half (already lo^hi)
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) cv[w] = tmp_state[w];
+    }
+
+    // Write 32-byte hash (8 u32 words, little-endian)
+    u32* dst = reinterpret_cast<u32*>(d_out32 + (size_t)seed * 32);
+    #pragma unroll
+    for (int w = 0; w < 8; ++w) dst[w] = cv[w];
+}
+
+
+// --- BLAKE3 hash of seed||C (240B + 1024B = 1264B) -> 32B ----------------
+__global__ void blake3_hash_seed_plus_c(
+    const uint8_t* __restrict__ d_seeds,   // 240B per item
+    const int32_t* __restrict__ d_C,       // 256 i32 (1024B) per item
+    uint8_t* __restrict__ d_out32,         // 32B per item
+    int batch)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch) return;
+
+    const uint8_t* seed = d_seeds + (size_t)idx * 240;
+    const uint8_t* Cb   = reinterpret_cast<const uint8_t*>(d_C + (size_t)idx * 256);
+
+    // ---- chunk 0 (1024B): seed[0..239] ++ Cb[0..783] ----
+    u32 cv0[8];
+    #pragma unroll
+    for (int w=0; w<8; ++w) cv0[w] = g_IV[w];
+    {
+        u32 state[16];
+        for (int blk=0; blk<16; ++blk) {
+            u32 m[16] = {0};
+            // fill 64B block from concatenated stream
+            #pragma unroll
+            for (int i=0; i<64; ++i) {
+                const int off = blk*64 + i;      // 0..1023 within chunk 0
+                uint8_t b;
+                if (off < 240)  b = seed[off];
+                else            b = Cb[off - 240]; // from C
+                reinterpret_cast<uint8_t*>(m)[i] = b;
+            }
+            u32 flags = 0;
+            if (blk == 0)  flags |= CHUNK_START;
+            if (blk == 15) flags |= CHUNK_END;
+            g_compress(cv0, m, /*t=*/0ULL, /*block_len=*/64u, flags, state);
+            #pragma unroll
+            for (int w=0; w<8; ++w) cv0[w] = state[w]; // next CV = low half
+        }
+    }
+
+    // ---- chunk 1 (240B): Cb[784..1023] ----
+    u32 cv1[8];
+    #pragma unroll
+    for (int w=0; w<8; ++w) cv1[w] = g_IV[w];
+    {
+        u32 state[16];
+        for (int blk=0; blk<4; ++blk) {
+            const u32 blen = (blk == 3) ? 48u : 64u; // 240B = 3*64 + 48
+            u32 m[16] = {0};
+            // fill from C tail (offset 784)
+            #pragma unroll
+            for (u32 i=0; i<blen; ++i) {
+                reinterpret_cast<uint8_t*>(m)[i] = Cb[784 + blk*64 + i];
+            }
+            u32 flags = 0;
+            if (blk == 0) flags |= CHUNK_START;
+            if (blk == 3) flags |= CHUNK_END;
+            g_compress(cv1, m, /*t=*/1ULL, blen, flags, state);
+            #pragma unroll
+            for (int w=0; w<8; ++w) cv1[w] = state[w];
+        }
+    }
+
+    // ---- parent combine (ROOT) of the two leaf CVs ----
+    {
+        u32 parent_in[16];
+        #pragma unroll
+        for (int w=0; w<8; ++w) parent_in[w]   = cv0[w];
+        #pragma unroll
+        for (int w=0; w<8; ++w) parent_in[8+w] = cv1[w];
+
+        u32 cv[8];  // parent uses IV as CV input
+        #pragma unroll
+        for (int w=0; w<8; ++w) cv[w] = g_IV[w];
+
+        u32 st[16];
+        g_compress(cv, parent_in, /*t=*/0ULL, /*block_len=*/64u,
+                   /*flags=*/PARENT | ROOT, st);
+
+        // write 32B root (low 8 words already lo^hi)
+        u32* dst = reinterpret_cast<u32*>(d_out32 + (size_t)idx * 32);
+        #pragma unroll
+        for (int w=0; w<8; ++w) dst[w] = st[w];
+    }
+}
+
+
 extern "C"
-void blake3_matmul_cuda(const void *d_seeds,size_t seed_len,
-                        void *d_out,size_t prod_len,int batch,
+void blake3_matmul_cuda(const void *d_seeds, size_t seed_len,
+                        void *d_out, size_t prod_len, int batch,
                         cudaStream_t s)
 {
-    (void)d_seeds; (void)seed_len; (void)d_out; (void)prod_len; (void)batch; (void)s;
+    // Expect 240-byte seeds, and either 1024B (C) or 32B (hash) per item.
+    constexpr size_t SEED = 240;
+    constexpr size_t A_BYTES = 16ull * 50240ull;      // 803,840
+    constexpr size_t B_BYTES = 16ull * 50240ull;      // 803,840
+    constexpr size_t AB_BYTES = A_BYTES + B_BYTES;    // 1,607,680
+    constexpr size_t C_BYTES = 16ull * 16ull * 4ull;  // 1,024
+    if (seed_len != SEED || batch <= 0) return;
+    if (prod_len != 32 && prod_len != C_BYTES) return;
+
+    // Scratch buffers (grow-once semantics like above)
+    static uint8_t* d_ab = nullptr;   // A||B per seed
+    static int32_t* d_C  = nullptr;   // 16x16 i32 per seed
+    static int cap = 0;
+
+    if (batch > cap) {
+        if (d_ab) cudaFree(d_ab);
+        if (d_C)  cudaFree(d_C);
+        cudaMalloc(&d_ab, (size_t)batch * AB_BYTES);
+        cudaMalloc(&d_C,  (size_t)batch * (C_BYTES));
+        cap = batch;
+    }
+
+    // 1) Build roots & final-leaf materials for XOF
+    static u32     *d_roots      = nullptr;
+    static u32     *d_precv      = nullptr;
+    static u32     *d_last_words = nullptr;
+    static uint8_t *d_last_len   = nullptr;
+    static int cap2 = 0;
+    if (batch > cap2) {
+        if (d_roots)      cudaFree(d_roots);
+        if (d_precv)      cudaFree(d_precv);
+        if (d_last_words) cudaFree(d_last_words);
+        if (d_last_len)   cudaFree(d_last_len);
+        cudaMalloc(&d_roots,      (size_t)batch * 8 * sizeof(u32));
+        cudaMalloc(&d_precv,      (size_t)batch * 8 * sizeof(u32));
+        cudaMalloc(&d_last_words, (size_t)batch * 16 * sizeof(u32));
+        cudaMalloc(&d_last_len,   (size_t)batch * sizeof(uint8_t));
+        cap2 = batch;
+    }
+
+    // One warp per pack of 8 seeds
+    int packs = (batch + 7) / 8;
+    root_hash8<<<packs, 32, 0, s>>>(
+        static_cast<const uint8_t*>(d_seeds),
+        d_roots, d_precv, d_last_words, d_last_len, batch);
+
+    // 2) XOF expand to A||B (exactly 1,607,680 bytes per seed)
+    {
+        const uint64_t blocks  = 25120ULL;           // 25,120 * 64B = 1,607,680B
+        const uint64_t threads = (uint64_t)batch * blocks;
+        dim3 blk(256), grd((threads + 255) / 256);
+        xof_expand<<<grd, blk, 0, s>>>(
+            d_roots, d_precv, d_last_words, d_last_len,
+            d_ab, AB_BYTES, batch);
+    }
+
+    // 3) Matmul C = A * B (u8 x i8 -> i32), one block (16x16) per seed
+    {
+        dim3 blk(16, 16, 1);
+        dim3 grd(batch, 1, 1);
+        matmul16x50240_u8_i8<<<grd, blk, 0, s>>>(d_ab, AB_BYTES, d_C, batch);
+    }
+
+//    // 4) Output selection: 1024B matrix or 32B BLAKE3(C) hash
+//    if (prod_len == C_BYTES) {
+//        // Raw 16x16 i32 matrix (row-major, little-endian)
+//        cudaMemcpyAsync(d_out, d_C, (size_t)batch * C_BYTES,
+//                        cudaMemcpyDeviceToDevice, s);
+//    } else {
+//        // BLAKE3 hash of exactly 1024 bytes (C) per seed (single chunk)
+//        int threads = 256;
+//        int blocks  = (batch + threads - 1) / threads;
+//        blake3_hash_c1024<<<blocks, threads, 0, s>>>(
+//            d_C, static_cast<uint8_t*>(d_out), batch);
+//    }
+    int threads = 256;
+    int blocks  = (batch + threads - 1) / threads;
+    blake3_hash_seed_plus_c<<<blocks, threads, 0, s>>>(
+        static_cast<const uint8_t*>(d_seeds),
+        d_C,
+        static_cast<uint8_t*>(d_out),
+        batch);
 }
