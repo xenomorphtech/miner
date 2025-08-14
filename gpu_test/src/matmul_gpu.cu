@@ -3,6 +3,10 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
+/* ==== TUI: add this include ============================================ */
+#include "miner_tui.h"
+/* ======================================================================= */
+
 /* Neutralize cudaDeviceSynchronize() when seen from device code inside
    the blaze3 kernel header (which calls it from a __global__ function). */
 #ifdef __CUDA_ARCH__
@@ -103,7 +107,6 @@ __global__ void xof_expand(const u32* __restrict__ d_roots,
     // Low 32B = out[0..7] (root CV for this t)
     #pragma unroll
     for (int w=0; w<8; ++w) dstw[w] = out[w];
-
 
     // Default/spec upper: hi ^ precv
     #pragma unroll
@@ -227,7 +230,6 @@ __global__ void matmul16x50240_u8_i8(
     int32_t* __restrict__ d_C,         // 16*16 i32 per seed (256 i32)
     int batch)
 {
-    // 2D thread: (i,j) in 16x16 tile, one block per seed
     const int i = threadIdx.y; // 0..15
     const int j = threadIdx.x; // 0..15
     const int seed = blockIdx.x;
@@ -243,13 +245,12 @@ __global__ void matmul16x50240_u8_i8(
     int32_t acc = 0;
     const int K = 50240;
 
-    // Row i of A, Column j of B (note B is row-major: B[k*16 + j])
     const size_t rowA = (size_t)i * K;
 
     #pragma unroll 4
     for (int k = 0; k < K; ++k) {
-        const int32_t a = (int32_t)A[rowA + k];              // u8 -> i32
-        const int32_t b = (int32_t)((int8_t)B[(size_t)k*16 + j]); // u8 reinterpreted as i8 -> i32
+        const int32_t a = (int32_t)A[rowA + k];
+        const int32_t b = (int32_t)((int8_t)B[(size_t)k*16 + j]);
         acc += a * b;
     }
 
@@ -265,12 +266,10 @@ __global__ void blake3_hash_c1024(
     const int seed = blockIdx.x * blockDim.x + threadIdx.x;
     if (seed >= batch) return;
 
-    // CV starts from IV
     u32 cv[8];
     #pragma unroll
     for (int w = 0; w < 8; ++w) cv[w] = g_IV[w];
 
-    // Process exactly 16 blocks (16 * 64B = 1024B)
     const u32* data = reinterpret_cast<const u32*>(d_C + (size_t)seed * 256);
     u32 tmp_state[16];
 
@@ -285,12 +284,10 @@ __global__ void blake3_hash_c1024(
 
         g_compress(cv, m, 0ULL, 64u, flags, tmp_state);
 
-        // Next CV = low half (already lo^hi)
         #pragma unroll
         for (int w = 0; w < 8; ++w) cv[w] = tmp_state[w];
     }
 
-    // Write 32-byte hash (8 u32 words, little-endian)
     u32* dst = reinterpret_cast<u32*>(d_out32 + (size_t)seed * 32);
     #pragma unroll
     for (int w = 0; w < 8; ++w) dst[w] = cv[w];
@@ -318,13 +315,12 @@ __global__ void blake3_hash_seed_plus_c(
         u32 state[16];
         for (int blk=0; blk<16; ++blk) {
             u32 m[16] = {0};
-            // fill 64B block from concatenated stream
             #pragma unroll
             for (int i=0; i<64; ++i) {
-                const int off = blk*64 + i;      // 0..1023 within chunk 0
+                const int off = blk*64 + i;
                 uint8_t b;
                 if (off < 240)  b = seed[off];
-                else            b = Cb[off - 240]; // from C
+                else            b = Cb[off - 240];
                 reinterpret_cast<uint8_t*>(m)[i] = b;
             }
             u32 flags = 0;
@@ -332,7 +328,7 @@ __global__ void blake3_hash_seed_plus_c(
             if (blk == 15) flags |= CHUNK_END;
             g_compress(cv0, m, /*t=*/0ULL, /*block_len=*/64u, flags, state);
             #pragma unroll
-            for (int w=0; w<8; ++w) cv0[w] = state[w]; // next CV = low half
+            for (int w=0; w<8; ++w) cv0[w] = state[w];
         }
     }
 
@@ -343,9 +339,8 @@ __global__ void blake3_hash_seed_plus_c(
     {
         u32 state[16];
         for (int blk=0; blk<4; ++blk) {
-            const u32 blen = (blk == 3) ? 48u : 64u; // 240B = 3*64 + 48
+            const u32 blen = (blk == 3) ? 48u : 64u;
             u32 m[16] = {0};
-            // fill from C tail (offset 784)
             #pragma unroll
             for (u32 i=0; i<blen; ++i) {
                 reinterpret_cast<uint8_t*>(m)[i] = Cb[784 + blk*64 + i];
@@ -367,7 +362,7 @@ __global__ void blake3_hash_seed_plus_c(
         #pragma unroll
         for (int w=0; w<8; ++w) parent_in[8+w] = cv1[w];
 
-        u32 cv[8];  // parent uses IV as CV input
+        u32 cv[8];
         #pragma unroll
         for (int w=0; w<8; ++w) cv[w] = g_IV[w];
 
@@ -375,7 +370,6 @@ __global__ void blake3_hash_seed_plus_c(
         g_compress(cv, parent_in, /*t=*/0ULL, /*block_len=*/64u,
                    /*flags=*/PARENT | ROOT, st);
 
-        // write 32B root (low 8 words already lo^hi)
         u32* dst = reinterpret_cast<u32*>(d_out32 + (size_t)idx * 32);
         #pragma unroll
         for (int w=0; w<8; ++w) dst[w] = st[w];
@@ -388,7 +382,6 @@ void blake3_matmul_cuda(const void *d_seeds, size_t seed_len,
                         void *d_out, size_t prod_len, int batch,
                         cudaStream_t s)
 {
-    // Expect 240-byte seeds, and either 1024B (C) or 32B (hash) per item.
     constexpr size_t SEED = 240;
     constexpr size_t A_BYTES = 16ull * 50240ull;      // 803,840
     constexpr size_t B_BYTES = 16ull * 50240ull;      // 803,840
@@ -397,7 +390,6 @@ void blake3_matmul_cuda(const void *d_seeds, size_t seed_len,
     if (seed_len != SEED || batch <= 0) return;
     if (prod_len != 32 && prod_len != C_BYTES) return;
 
-    // Scratch buffers (grow-once semantics like above)
     static uint8_t* d_ab = nullptr;   // A||B per seed
     static int32_t* d_C  = nullptr;   // 16x16 i32 per seed
     static int cap = 0;
@@ -410,7 +402,6 @@ void blake3_matmul_cuda(const void *d_seeds, size_t seed_len,
         cap = batch;
     }
 
-    // 1) Build roots & final-leaf materials for XOF
     static u32     *d_roots      = nullptr;
     static u32     *d_precv      = nullptr;
     static u32     *d_last_words = nullptr;
@@ -428,15 +419,13 @@ void blake3_matmul_cuda(const void *d_seeds, size_t seed_len,
         cap2 = batch;
     }
 
-    // One warp per pack of 8 seeds
     int packs = (batch + 7) / 8;
     root_hash8<<<packs, 32, 0, s>>>(
         static_cast<const uint8_t*>(d_seeds),
         d_roots, d_precv, d_last_words, d_last_len, batch);
 
-    // 2) XOF expand to A||B (exactly 1,607,680 bytes per seed)
     {
-        const uint64_t blocks  = 25120ULL;           // 25,120 * 64B = 1,607,680B
+        const uint64_t blocks  = 25120ULL;
         const uint64_t threads = (uint64_t)batch * blocks;
         dim3 blk(256), grd((threads + 255) / 256);
         xof_expand<<<grd, blk, 0, s>>>(
@@ -444,25 +433,12 @@ void blake3_matmul_cuda(const void *d_seeds, size_t seed_len,
             d_ab, AB_BYTES, batch);
     }
 
-    // 3) Matmul C = A * B (u8 x i8 -> i32), one block (16x16) per seed
     {
         dim3 blk(16, 16, 1);
         dim3 grd(batch, 1, 1);
         matmul16x50240_u8_i8<<<grd, blk, 0, s>>>(d_ab, AB_BYTES, d_C, batch);
     }
 
-//    // 4) Output selection: 1024B matrix or 32B BLAKE3(C) hash
-//    if (prod_len == C_BYTES) {
-//        // Raw 16x16 i32 matrix (row-major, little-endian)
-//        cudaMemcpyAsync(d_out, d_C, (size_t)batch * C_BYTES,
-//                        cudaMemcpyDeviceToDevice, s);
-//    } else {
-//        // BLAKE3 hash of exactly 1024 bytes (C) per seed (single chunk)
-//        int threads = 256;
-//        int blocks  = (batch + threads - 1) / threads;
-//        blake3_hash_c1024<<<blocks, threads, 0, s>>>(
-//            d_C, static_cast<uint8_t*>(d_out), batch);
-//    }
     int threads = 256;
     int blocks  = (batch + threads - 1) / threads;
     blake3_hash_seed_plus_c<<<blocks, threads, 0, s>>>(
@@ -507,17 +483,14 @@ __global__ void find_first_two_zeroes(
 
     const uint8_t* h = d_hash32 + (size_t)idx * 32;
     if ((h[0] == 0x00) && (h[1] == 0x00) && ((h[2] & 0xf) == 0x00)) {
-        // claim "first"
         int old = atomicCAS(d_found_idx, -1, idx);
         if (old == -1) {
-            // read nonce (LE) from seed tail [232..239]
             const uint8_t* tail = d_seeds + (size_t)idx*240 + 232;
             uint64_t n = 0;
             #pragma unroll
             for (int i=0;i<8;++i) n |= ((uint64_t)tail[i]) << (8*i);
             *d_found_nonce = n;
 
-            // read u32 at byte offset 228 (aligned)
             const uint32_t* p228 =
                 reinterpret_cast<const uint32_t*>(d_seeds + (size_t)idx*240 + 228);
             *d_found_u32_at_228 = *p228;
@@ -528,12 +501,10 @@ __global__ void find_first_two_zeroes(
 #define TILE_K 256   // Good starting point; keep multiple of 32 (and 4)
 #endif
 
-// Shared tiles (byte-addressable). We will read them as int (packed 4x int8).
-// Align to 16 so packed reads are naturally aligned in shared memory.
 __global__ void matmul16x50240_u8_i8_dp4a_tiled(
-    const uint8_t* __restrict__ d_ab,  // A||B per seed (1,607,680 bytes)
+    const uint8_t* __restrict__ d_ab,
     size_t per_ab,
-    int32_t* __restrict__ d_C,         // 16*16 i32 per seed (256 i32)
+    int32_t* __restrict__ d_C,
     int batch)
 {
     const int i    = threadIdx.y; // 0..15
@@ -548,61 +519,41 @@ __global__ void matmul16x50240_u8_i8_dp4a_tiled(
     const uint8_t* A = base;                 // [16 x 50240] row-major u8
     const uint8_t* B = base + A_BYTES;       // [50240 x 16] row-major, interpret as i8
 
-    // Shared memory tiles: A[16 x TILE_K], B[TILE_K x 16]
     extern __shared__ uint8_t smem[];
     uint8_t* As = smem;                                    // 16*TILE_K bytes
     uint8_t* Bs = smem + (size_t)16 * TILE_K;              // TILE_K*16 bytes
 
-    // Accumulators
-    int acc = 0;        // main dot product on signed int8 via dp4a
-    int sum_b = 0;      // sum of B's signed bytes for column j, for bias fix
+    int acc = 0;
+    int sum_b = 0;
 
-    // Strides
-    const size_t rowA = (size_t)i * (size_t)K;             // byte stride in A
-    // B is row-major: element (k,j) at B[k*16 + j]
+    const size_t rowA = (size_t)i * (size_t)K;
 
-    // Loop over K in tiles of TILE_K
     for (int k0 = 0; k0 < K; k0 += TILE_K) {
         const int tile = min(TILE_K, K - k0);
 
-        // --- Load A tile rows into shared memory ---
-        // Each thread in the 16x16 block helps load both tiles in stripes.
-        // Load A row i for the current tile [k0 .. k0+tile)
         for (int kk = threadIdx.x; kk < tile; kk += blockDim.x) {
             As[i * TILE_K + kk] = A[rowA + (k0 + kk)];
         }
-
-        // --- Load B tile rows into shared memory ---
-        // We want Bs[kk, j] = B[(k0 + kk), j]
         for (int kk = threadIdx.y; kk < tile; kk += blockDim.y) {
             Bs[kk * 16 + j] = B[((size_t)(k0 + kk) * 16) + j];
         }
 
         __syncthreads();
 
-        // --- Compute on the current tile with DP4A ---
-        // Process in groups of 4 so we can pack 4 int8 into a 32-bit int.
-        // For A: convert to signed by subtracting 128 before packing.
         int kk = 0;
-        // Fast path: groups of 4
         for (; kk + 3 < tile; kk += 4) {
-            // Pack 4 A bytes as signed (a_u8 - 128)
             int a_packed;
             {
-                // Shared is byte aligned; take 4 consecutive bytes and bias in registers.
-                // Read as bytes first:
                 int a0 = (int)((unsigned)As[i * TILE_K + kk + 0]) - 128;
                 int a1 = (int)((unsigned)As[i * TILE_K + kk + 1]) - 128;
                 int a2 = (int)((unsigned)As[i * TILE_K + kk + 2]) - 128;
                 int a3 = (int)((unsigned)As[i * TILE_K + kk + 3]) - 128;
-                // Pack into little-endian 4× int8 in a 32-bit int
                 a_packed  = ((a0 & 0xFF)) |
                             ((a1 & 0xFF) << 8) |
                             ((a2 & 0xFF) << 16) |
                             ((a3 & 0xFF) << 24);
             }
 
-            // Pack 4 B bytes as signed
             int b_packed;
             {
                 int b0 = (int)((int8_t)Bs[(kk + 0) * 16 + j]);
@@ -613,15 +564,12 @@ __global__ void matmul16x50240_u8_i8_dp4a_tiled(
                             ((b1 & 0xFF) << 8) |
                             ((b2 & 0xFF) << 16) |
                             ((b3 & 0xFF) << 24);
-                // Accumulate sum_b at the same time (sum of signed bytes)
                 sum_b += b0 + b1 + b2 + b3;
             }
 
-            // 4-way int8 dot product (signed) + accumulate
             acc = __dp4a(a_packed, b_packed, acc);
         }
 
-        // Handle the (at most) 3 leftover bytes in this tile
         for (; kk < tile; ++kk) {
             int a_s = (int)((unsigned)As[i * TILE_K + kk]) - 128;
             int b_s = (int)((int8_t)Bs[kk * 16 + j]);
@@ -632,29 +580,26 @@ __global__ void matmul16x50240_u8_i8_dp4a_tiled(
         __syncthreads();
     }
 
-    // Bias correction for (a_u8 - 128) transform
     acc += 128 * sum_b;
 
     d_C[(size_t)seed * 256 + (size_t)i * 16 + j] = acc;
 }
-// --- Emit one 64B XOF block into 16 u32 words (dstw) ---
-// Mirrors xof_expand: low 32B = out[0..7]; upper 32B = hi (^precv by default)
-// Handles debug g_xof_layout.xof_flag_mode and b0_mode the same way.
+
+// --- Emit one 64B XOF block into 16 u32 words (dstw)
 __device__ inline void xof_emit_words(
-    uint32_t blk,                     // 0..25119 within this seed
-    const u32 root[8],                // for debug DERIVE_KEY_MATERIAL path
+    uint32_t blk,
+    const u32 root[8],
     const u32 precv[8],
     const u32 last_words[16],
     u32 last_len,
-    u32 dstw[16])                     // out words to write (64 bytes)
+    u32 dstw[16])
 {
     u32 out[16];
 
     const uint64_t t = (uint64_t)blk + (uint64_t)g_xof_layout.counter_offset;
 
     if (g_xof_layout.xof_flag_mode == 1) {
-        // --- DEBUG: legacy DERIVE_KEY_MATERIAL path ---
-        u32 cv[8]; 
+        u32 cv[8];
         #pragma unroll
         for (int i=0;i<8;++i) cv[i]=root[i];
         u32 m[16] = {0}; m[15] = DERIVE_KEY_MATERIAL;
@@ -664,14 +609,11 @@ __device__ inline void xof_emit_words(
         return;
     }
 
-    // --- SPEC path: recompress final leaf at counter t
     recompress_final_leaf(precv, last_words, last_len, t, out);
 
-    // Low 32B
     #pragma unroll
     for (int w=0; w<8; ++w) dstw[w] = out[w];
 
-    // Default/spec upper: hi ^ precv
     #pragma unroll
     for (int w=0; w<8; ++w) dstw[8+w] = out[8+w] ^ precv[w];
 }
@@ -680,105 +622,81 @@ __device__ inline void xof_emit_words(
 #define TILE_K 256  // multiple of 64 and 4
 #endif
 
-// Shared memory is byte-addressable but 16B-aligned for packed u32 writes.
 __global__ void matmul16x50240_u8_i8_dp4a_fused_xof(
-    const u32* __restrict__ d_roots,       // [batch x 8]
-    const u32* __restrict__ d_precv,       // [batch x 8]
-    const u32* __restrict__ d_last_words,  // [batch x 16]
-    const uint8_t* __restrict__ d_last_len,// [batch]
-    int32_t* __restrict__ d_C,             // [batch x 16 x 16] i32
+    const u32* __restrict__ d_roots,
+    const u32* __restrict__ d_precv,
+    const u32* __restrict__ d_last_words,
+    const uint8_t* __restrict__ d_last_len,
+    int32_t* __restrict__ d_C,
     int batch)
 {
-    const int i    = threadIdx.y;  // 0..15 row of C
-    const int j    = threadIdx.x;  // 0..15 col of C
+    const int i    = threadIdx.y;  // 0..15
+    const int j    = threadIdx.x;  // 0..15
     const int seed = blockIdx.x;
     if (seed >= batch || i >= 16 || j >= 16) return;
 
-    // Pointers for this seed
     const u32* root   = d_roots      + (size_t)seed * 8;
     const u32* precv  = d_precv      + (size_t)seed * 8;
     const u32* lwords = d_last_words + (size_t)seed * 16;
     const u32  llen   = d_last_len[seed];
 
-    // Matrix shape
     constexpr int K = 50240;
     constexpr int A_BYTES = 16 * K;    // 803,840
     constexpr int A_BLOCKS = A_BYTES / 64; // 12,560
     constexpr int B_BASE_BLOCK = A_BLOCKS; // 12,560
 
-    // Shared memory layout: As[16×TILE_K] || Bs[TILE_K×16]
     extern __shared__ __align__(16) uint8_t smem[];
     uint8_t* As = smem;                             // 16*TILE_K bytes
     uint8_t* Bs = smem + (size_t)16 * TILE_K;       // TILE_K*16 bytes
 
-    // Accumulators
     int acc   = 0;
-    int sum_b = 0;  // for bias fix when casting A_u8->(A_s8 = A_u8 - 128)
+    int sum_b = 0;
 
-    // Process K in tiles of TILE_K
     for (int k0 = 0; k0 < K; k0 += TILE_K) {
         const int tile = min(TILE_K, K - k0);
 
-        // --------- Generate A tile: 16 rows × (tile/64) blocks per row ----------
-        // Each block produces 64 bytes for a given row and 64 consecutive k's.
-        const int a_blocks_per_row = (tile + 63) / 64;   // usually TILE_K/64
+        const int a_blocks_per_row = (tile + 63) / 64;
         for (int ri = i; ri < 16; ri += blockDim.y) {
             for (int rb = j; rb < a_blocks_per_row; rb += blockDim.x) {
-                const int kk_base = rb * 64;             // within tile
-                // blk index inside AB stream:
-                // blkA = ri*(K/64) + (k0/64) + rb
+                const int kk_base = rb * 64;
                 const uint32_t blkA = (uint32_t)(ri * (K/64) + (k0/64) + rb);
                 u32 words[16];
                 xof_emit_words(blkA, root, precv, lwords, llen, words);
 
-                // Write 64 bytes into As[ri, kk_base..kk_base+63]
                 uint8_t* dst = As + (size_t)ri * TILE_K + kk_base;
-                // words are little-endian; store as 16 u32
                 u32* dstw = reinterpret_cast<u32*>(dst);
                 #pragma unroll
                 for (int w=0; w<16; ++w) dstw[w] = words[w];
             }
         }
 
-        // --------- Generate B tile: (tile/4) blocks, shared across all columns ---
-        // For each group of 4 consecutive k's, one 64B block covers all 16 columns.
-        const int b_blocks = (tile + 3) / 4;            // usually TILE_K/4
-        for (int gb = i; gb < b_blocks; gb += blockDim.y) {
-            // kk_base in [0..tile), step 4
-            const int kk_base = gb * 4;
-            // blkB = B_BASE_BLOCK + ((k0 + kk_base) * 16) / 64
-            //      = 12560 + (k0 + kk_base)/4
-            const uint32_t blkB = (uint32_t)(B_BASE_BLOCK + ((k0 + kk_base) >> 2));
-            u32 words[16];
-            xof_emit_words(blkB, root, precv, lwords, llen, words);
+        const int b_blocks = (tile + 3) / 4;
+        const int tlin     = threadIdx.y * blockDim.x + threadIdx.x;  // 0..255
+const int tstride  = blockDim.x * blockDim.y;                  // 256
+for (int gb = tlin; gb < b_blocks; gb += tstride) {
+    const int kk_base   = gb * 4; // four consecutive k
+    const uint32_t blkB = (uint32_t)(B_BASE_BLOCK + ((k0 + kk_base) >> 2));
+    u32 words[16];
+    xof_emit_words(blkB, root, precv, lwords, llen, words);
 
-            // Copy the 64 bytes into Bs rows: four chunks of 16 bytes
-            const uint8_t* src = reinterpret_cast<const uint8_t*>(words);
-            #pragma unroll
-            for (int q=0; q<4; ++q) {
-                const int kk = kk_base + q;
-                if (kk < tile) {
-                    uint8_t* dst = Bs + (size_t)kk * 16;
-                    // 16 bytes: copy 4 u32
-                    reinterpret_cast<u32*>(dst)[0] =
-                        reinterpret_cast<const u32*>(src + q*16)[0];
-                    reinterpret_cast<u32*>(dst)[1] =
-                        reinterpret_cast<const u32*>(src + q*16)[1];
-                    reinterpret_cast<u32*>(dst)[2] =
-                        reinterpret_cast<const u32*>(src + q*16)[2];
-                    reinterpret_cast<u32*>(dst)[3] =
-                        reinterpret_cast<const u32*>(src + q*16)[3];
-                }
-            }
+    // scatter 64B into Bs rows: four chunks of 16B
+    const uint32_t* srcw = reinterpret_cast<const uint32_t*>(words);
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int kk = kk_base + q;
+        if (kk < tile) {
+            uint32_t* dstw = reinterpret_cast<uint32_t*>(Bs + (size_t)kk * 16);
+            dstw[0] = srcw[q*4 + 0];
+            dstw[1] = srcw[q*4 + 1];
+            dstw[2] = srcw[q*4 + 2];
+            dstw[3] = srcw[q*4 + 3];
         }
-
+    }
+}
         __syncthreads();
 
-        // ----------------- Compute C[i,j] on this tile via DP4A -----------------
         int kk = 0;
-        // fast path in groups of 4 for dp4a
         for (; kk + 3 < tile; kk += 4) {
-            // pack 4 A bytes from As row i, subtract 128 to convert to signed
             int a0 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 0]) - 128;
             int a1 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 1]) - 128;
             int a2 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 2]) - 128;
@@ -788,7 +706,6 @@ __global__ void matmul16x50240_u8_i8_dp4a_fused_xof(
                           | ((a2 & 0xFF) << 16)
                           | ((a3 & 0xFF) << 24);
 
-            // pack 4 B signed bytes from Bs column j
             int b0 = (int)((int8_t)Bs[(size_t)(kk + 0) * 16 + j]);
             int b1 = (int)((int8_t)Bs[(size_t)(kk + 1) * 16 + j]);
             int b2 = (int)((int8_t)Bs[(size_t)(kk + 2) * 16 + j]);
@@ -801,7 +718,6 @@ __global__ void matmul16x50240_u8_i8_dp4a_fused_xof(
             sum_b += b0 + b1 + b2 + b3;
             acc = __dp4a(a_packed, b_packed, acc);
         }
-        // leftovers (<=3)
         for (; kk < tile; ++kk) {
             int a_s = (int)((unsigned)As[(size_t)i*TILE_K + kk]) - 128;
             int b_s = (int)((int8_t)Bs[(size_t)kk * 16 + j]);
@@ -812,17 +728,12 @@ __global__ void matmul16x50240_u8_i8_dp4a_fused_xof(
         __syncthreads();
     }
 
-    // Bias correction to undo (A_u8 -> A_s8 = A_u8 - 128)
     acc += 128 * sum_b;
 
     d_C[(size_t)seed * 256 + (size_t)i * 16 + j] = acc;
 }
 
 // Searches for the first hash (of seed||C) that starts with two 0x00 bytes.
-// Assumptions:
-// - Nonce is stored LE in seed bytes [232..239] (last 8 bytes).
-// - We iterate nonces as: start_nonce + round*batch + idx.
-// Returns true if found; sets *h_found_idx (0..batch-1) and *h_found_nonce.
 extern "C"
 bool blake3_matmul_cuda_find2zero(
     void*       d_seeds,       size_t seed_len,   // 240
@@ -835,48 +746,45 @@ bool blake3_matmul_cuda_find2zero(
     uint32_t*   h_found_u32_at_228,
     cudaStream_t s)
 {
-    constexpr size_t SEED = 240;
-    if (seed_len != SEED || batch <= 0) return false;
-    if (out_len != (size_t)batch * 32) return false;
+    constexpr size_t SEED    = 240;
+    constexpr size_t C_BYTES = 16ull * 16ull * 4ull; // 1024B per seed
 
-    // device-side found flags
-    int *d_found_idx = nullptr;
-    uint64_t *d_found_nonce = nullptr;
-    uint32_t *d_found_u32_at_228 = nullptr;
-                                            
-    cudaMalloc(&d_found_idx, sizeof(int));
-    cudaMalloc(&d_found_nonce, sizeof(uint64_t));
+    if (seed_len != SEED || batch <= 0) return false;
+    if (out_len != (size_t)batch * 32)  return false;
+
+    // ---- TUI autostart (console + NDJSON). If you don't want this here,
+    //      move these 4 calls to your main() and remove start/stop below.
+    #if __has_include("miner_tui.h")
+    #  include "miner_tui.h"
+       miner_tui_start(/*gpu*/0, /*ms*/500, "miner_bench.ndjson");
+       miner_tui_set_tag("find2zero");
+       miner_tui_set_batch(batch);
+    #endif
+
+    // ---- device-side "found" flags -----------------------------------------
+    int*       d_found_idx          = nullptr;
+    uint64_t*  d_found_nonce        = nullptr;
+    uint32_t*  d_found_u32_at_228   = nullptr;
+
+    cudaMalloc(&d_found_idx,        sizeof(int));
+    cudaMalloc(&d_found_nonce,      sizeof(uint64_t));
     cudaMalloc(&d_found_u32_at_228, sizeof(uint32_t));
 
     auto reset_found = [&]() {
         int init = -1;
         uint64_t z = 0;
-        cudaMemcpyAsync(d_found_idx, &init, sizeof(int), cudaMemcpyHostToDevice, s);
-        cudaMemcpyAsync(d_found_nonce, &z, sizeof(uint64_t), cudaMemcpyHostToDevice, s);
-     };
+        cudaMemcpyAsync(d_found_idx,   &init, sizeof(int),      cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(d_found_nonce, &z,    sizeof(uint64_t), cudaMemcpyHostToDevice, s);
+        // u32@228 is written only on success
+    };
 
-    // Scratch hash buffer is the user's d_out_hashes (32B * batch)
-    // We reuse your existing internal scratch from blake3_matmul_cuda path:
-    // d_ab, d_C, d_roots, d_precv, d_last_words, d_last_len etc.
-    // We'll replicate the pipeline with nonce write + compute + check in a loop.
-
-    // Internal constants matching your existing code:
-    constexpr size_t A_BYTES  = 16ull * 50240ull;
-    constexpr size_t B_BYTES  = 16ull * 50240ull;
-    constexpr size_t AB_BYTES = A_BYTES + B_BYTES;
-    constexpr size_t C_BYTES  = 16ull * 16ull * 4ull;
-
-    // ---- grow-once scratch (mirroring your function) ----
-    static uint8_t* d_ab = nullptr;   // A||B per seed
-    static int32_t* d_C  = nullptr;   // 16x16 i32 per seed
-    static int cap = 0;
-
-    if (batch > cap) {
-        if (d_ab) cudaFree(d_ab);
-        if (d_C)  cudaFree(d_C);
-        cudaMalloc(&d_ab, (size_t)batch * AB_BYTES);
-        cudaMalloc(&d_C,  (size_t)batch * C_BYTES);
-        cap = batch;
+    // ---- grow-once scratch (FUSED path only: NO d_ab here) -----------------
+    static int32_t* d_C = nullptr;   // [batch x 16 x 16] i32
+    static int capC = 0;
+    if (batch > capC) {
+        if (d_C) cudaFree(d_C);
+        cudaMalloc(&d_C, (size_t)batch * C_BYTES);
+        capC = batch;
     }
 
     static u32     *d_roots      = nullptr;
@@ -889,121 +797,121 @@ bool blake3_matmul_cuda_find2zero(
         if (d_precv)      cudaFree(d_precv);
         if (d_last_words) cudaFree(d_last_words);
         if (d_last_len)   cudaFree(d_last_len);
-        cudaMalloc(&d_roots,      (size_t)batch * 8 * sizeof(u32));
-        cudaMalloc(&d_precv,      (size_t)batch * 8 * sizeof(u32));
+        cudaMalloc(&d_roots,      (size_t)batch * 8  * sizeof(u32));
+        cudaMalloc(&d_precv,      (size_t)batch * 8  * sizeof(u32));
         cudaMalloc(&d_last_words, (size_t)batch * 16 * sizeof(u32));
         cudaMalloc(&d_last_len,   (size_t)batch * sizeof(uint8_t));
         cap2 = batch;
     }
 
-    // Kernel launch shapes
+    // ---- launches -----------------------------------------------------------
     const int threads = 256;
     const int blocksB = (batch + threads - 1) / threads;
 
-    // XOF expansion grid (same as your code)
-    const uint64_t blocks  = 25120ULL;
-    const uint64_t threads_total = (uint64_t)batch * blocks;
-    dim3 xof_blk(256), xof_grd((threads_total + 255) / 256);
-
-    // GEMM launch
     dim3 gemm_blk(16, 16, 1);
     dim3 gemm_grd(batch, 1, 1);
+    const size_t smem_bytes = (size_t)16 * TILE_K + (size_t)TILE_K * 16; // As + Bs
 
-    // ---- rounds loop ----
+    // timing
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
     bool found = false;
-    *h_found_idx   = -1;
-    *h_found_nonce = 0;
-    *h_found_u32_at_228  = 0;
+    *h_found_idx        = -1;
+    *h_found_nonce      = 0;
+    *h_found_u32_at_228 = 0;
 
     reset_found();
 
-cudaEvent_t start, stop;
-cudaEventCreate(&start);
-cudaEventCreate(&stop);
-
     for (int round = 0; round < max_rounds; ++round) {
-
         cudaEventRecord(start, s);
 
-        // 0) Write nonces for this round into seeds tail (in-place)
+        // 0) write nonces (LE) into seed tails
         write_nonces_tail_le<<<blocksB, threads, 0, s>>>(
             static_cast<uint8_t*>(d_seeds),
-            batch,
-            start_nonce,
-            (uint64_t)round,
-            (uint64_t)batch
-        );
+            batch, start_nonce, (uint64_t)round, (uint64_t)batch);
 
-        // 1) Build roots/final-leaf for XOF
+        // 1) build roots/final-leaf materials for XOF
         {
-            int packs = (batch + 7) / 8;
+            int packs = (batch + 7) / 8; // one warp per 8 seeds
             root_hash8<<<packs, 32, 0, s>>>(
                 static_cast<const uint8_t*>(d_seeds),
                 d_roots, d_precv, d_last_words, d_last_len, batch);
         }
 
-        // 2) XOF expand -> A||B
-       // 3) GEMM C = A * B
-{
-    dim3 blk(16, 16, 1);
-    dim3 grd(batch, 1, 1);
-    size_t smem_bytes = (size_t)16 * TILE_K + (size_t)TILE_K * 16;
-    matmul16x50240_u8_i8_dp4a_fused_xof<<<grd, blk, smem_bytes, s>>>(
-        d_roots, d_precv, d_last_words, d_last_len,
-        d_C, batch);
-}
+        // 2+3) fused XOF+GEMM into C
+        matmul16x50240_u8_i8_dp4a_fused_xof<<<gemm_grd, gemm_blk, smem_bytes, s>>>(
+            d_roots, d_precv, d_last_words, d_last_len,
+            d_C, batch);
 
-        // 4) Hash seed||C -> 32B
+        // 4) hash seed||C -> 32B per seed
         blake3_hash_seed_plus_c<<<blocksB, threads, 0, s>>>(
             static_cast<const uint8_t*>(d_seeds),
             d_C,
             static_cast<uint8_t*>(d_out_hashes),
             batch);
 
-        // 5) Check for two leading zero bytes, claim first
+        // 5) difficulty check and capture first winner
         find_first_two_zeroes<<<blocksB, threads, 0, s>>>(
             static_cast<const uint8_t*>(d_out_hashes),
             static_cast<const uint8_t*>(d_seeds),
             batch,
             d_found_idx,
             d_found_nonce,
-            d_found_u32_at_228
-        );
+            d_found_u32_at_228);
 
-
+        // timing done
         cudaEventRecord(stop, s);
         cudaEventSynchronize(stop);
 
         float ms_round = 0.0f;
         cudaEventElapsedTime(&ms_round, start, stop);
 
-        double hps = (double)batch / (ms_round / 1000.0);
-        printf("Round %d: %.2f MH/s\n", round, hps / 1e6);
+        #if __has_include("miner_tui.h")
+           miner_tui_record_round_ms(ms_round);
+        #else
+           // fallback print if TUI not compiled in
+           double hps = (double)batch / (ms_round / 1000.0);
+           std::printf("Round %d: %.2f MH/s\n", round, hps/1e6);
+        #endif
 
-        // Pull flag to host
+        // pull the flag
         int h_idx = -1;
-        cudaMemcpyAsync(&h_idx, d_found_idx, sizeof(int), cudaMemcpyDeviceToHost, s);
-        //cudaStreamSynchronize(s);
-
+        cudaMemcpy(&h_idx, d_found_idx, sizeof(int), cudaMemcpyDeviceToHost);
 
         if (h_idx != -1) {
             uint64_t h_nonce = 0;
             uint32_t h_u32_228 = 0;
-            cudaMemcpy(&h_nonce, d_found_nonce, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&h_nonce,   d_found_nonce,        sizeof(uint64_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&h_u32_228, d_found_u32_at_228,   sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
-            cudaMemcpy(&h_u32_228, d_found_u32_at_228, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-            *h_found_idx   = h_idx;
-            *h_found_nonce = h_nonce;
+            *h_found_idx        = h_idx;
+            *h_found_nonce      = h_nonce;
             *h_found_u32_at_228 = h_u32_228;
+
+            #if __has_include("miner_tui.h")
+              miner_tui_mark_found(h_idx);
+            #endif
+
             found = true;
             break;
         }
-        // else continue next round with new nonces
+        // If you want to search again without returning, uncomment:
+        // reset_found();
     }
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     cudaFree(d_found_idx);
     cudaFree(d_found_nonce);
+    cudaFree(d_found_u32_at_228);
+
+    #if __has_include("miner_tui.h")
+      miner_tui_stop();
+    #endif
+
     return found;
 }
-
 
