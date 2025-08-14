@@ -128,6 +128,16 @@ void poll_until_found(RingMeta* d_ring, FoundResult* d_buf, int ring_cap) {
     }
 }
 
+// Simple CUDA check
+#define CUDA_OK(call) do {                                   \
+    cudaError_t _e = (call);                                 \
+    if (_e != cudaSuccess) {                                 \
+        std::fprintf(stderr, "%s:%d CUDA error: %s\n",       \
+                     __FILE__, __LINE__, cudaGetErrorString(_e)); \
+        std::exit(1);                                        \
+    }                                                        \
+} while (0)
+
 extern "C"
 void start_persistent_miner(
     const uint8_t* d_seed_bases, int batch,
@@ -141,43 +151,29 @@ void start_persistent_miner(
 int main() {
     uint64_t batch = 1 << 13;
     int SM_count = 128;
+
+
+    // 1) Host seed bases (define and fill)
+    std::vector<uint8_t> h_seed_bases(batch * 240);
+    // TODO: fill with your real 240-byte bases per item
+    std::memset(h_seed_bases.data(), 0, h_seed_bases.size());
     uint8_t* d_seed_bases = nullptr;
+
     cudaMalloc(&d_seed_bases, batch*240);
     cudaMemcpy(d_seed_bases, h_seed_bases, batch*240, cudaMemcpyHostToDevice);
     
 
-    uint8_t* d_seed_bases = nullptr;
-    CUDA_OK(cudaMalloc(&d_seed_bases, h_seed_bases.size()));
-    CUDA_OK(cudaMemcpy(d_seed_bases,
-                       h_seed_bases.data(),
-                       h_seed_bases.size(),
-                       cudaMemcpyHostToDevice));
-
-
-   MinerCtrl *d_ctl = nullptr;
-    RingMeta  *d_ring = nullptr;
-    FoundResult *d_buf = nullptr;
-
     const int ring_cap = 1024;
     // Use std::min with matching types; grid blocks is an int.
-    int blocks = static_cast<int>(std::min<uint64_t>(batch, static_cast<uint64_t>(2 * SM_count)));
-
-  std::vector<uint8_t> h_seed_bases(batch * 240);
-    // TODO: fill with your real 240-byte bases per item
-    std::memset(h_seed_bases.data(), 0, h_seed_bases.size());
-    
+    int blocks = 2 * SM_count;
 
     // 3) Start miner
     MinerCtrl *d_ctl = nullptr;
     RingMeta  *d_ring = nullptr;
     FoundResult *d_buf = nullptr;
 
-    const int ring_cap = 1024;
-    // Use std::min with matching types; grid blocks is an int.
-    int blocks = static_cast<int>(std::min<uint64_t>(batch, static_cast<uint64_t>(2 * SM_count)));
-
     start_persistent_miner(d_seed_bases, batch, &d_ctl, &d_ring, &d_buf,
-      /*ring_cap=*/1024, /*blocks=*/min(batch, 2*SM_count));
+      /*ring_cap=*/1024, /*blocks=*/2*SM_count);
     
     // 4) Poll (CALL it, don't declare it)
     bool ok = poll_until_found(d_ring, d_buf, ring_cap);
