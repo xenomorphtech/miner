@@ -108,6 +108,94 @@ __device__ void g_compress(
     }
 }
 
+__forceinline__ __device__ u32 rotr(u32 x, int n) {
+    return __funnelshift_r(x, x, n);
+}
+
+#define G(a,b,c,d, mx, my)        \
+    do {                          \
+        a = a + b + (mx);         \
+        d = rotr(d ^ a, 16);      \
+        c = c + d;                \
+        b = rotr(b ^ c, 12);      \
+        a = a + b + (my);         \
+        d = rotr(d ^ a, 8);       \
+        c = c + d;                \
+        b = rotr(b ^ c, 7);       \
+    } while(0)
+
+__forceinline__ __device__
+void g_compress_fast(const u32* __restrict cv,
+                     const u32* __restrict block_words,
+                     u64 counter, u32 block_len, u32 flags,
+                     u32* __restrict out_state /* 16 */)
+{
+    // State in registers
+    u32 v0, v1, v2, v3, v4, v5, v6, v7;
+    u32 v8, v9, v10, v11, v12, v13, v14, v15;
+
+    v0 = cv[0]; v1 = cv[1]; v2 = cv[2]; v3 = cv[3];
+    v4 = cv[4]; v5 = cv[5]; v6 = cv[6]; v7 = cv[7];
+
+    v8  = kIV[0]; v9  = kIV[1]; v10 = kIV[2]; v11 = kIV[3];
+    v12 = (u32)counter;
+    v13 = (u32)(counter >> 32);
+    v14 = block_len;
+    v15 = flags;
+
+    // Load message to registers (assumes aligned, little-endian)
+    u32 m0 = block_words[0];  u32 m1 = block_words[1];
+    u32 m2 = block_words[2];  u32 m3 = block_words[3];
+    u32 m4 = block_words[4];  u32 m5 = block_words[5];
+    u32 m6 = block_words[6];  u32 m7 = block_words[7];
+    u32 m8 = block_words[8];  u32 m9 = block_words[9];
+    u32 m10= block_words[10]; u32 m11= block_words[11];
+    u32 m12= block_words[12]; u32 m13= block_words[13];
+    u32 m14= block_words[14]; u32 m15= block_words[15];
+
+    // Helper to index m by compile-time schedule
+    auto M = [&](int r, int i)->u32 {
+        switch (kMsgIdx[r][i]) {
+            case  0: return m0;  case  1: return m1;  case  2: return m2;  case  3: return m3;
+            case  4: return m4;  case  5: return m5;  case  6: return m6;  case  7: return m7;
+            case  8: return m8;  case  9: return m9;  case 10: return m10; case 11: return m11;
+            case 12: return m12; case 13: return m13; case 14: return m14; case 15: return m15;
+        }
+        return 0u;
+    };
+
+    #pragma unroll
+    for (int r = 0; r < 7; ++r) {
+        // columns
+        G(v0, v4, v8, v12,  M(r,0),  M(r,1));
+        G(v1, v5, v9, v13,  M(r,2),  M(r,3));
+        G(v2, v6, v10,v14,  M(r,4),  M(r,5));
+        G(v3, v7, v11,v15,  M(r,6),  M(r,7));
+        // diagonals
+        G(v0, v5, v10,v15,  M(r,8),  M(r,9));
+        G(v1, v6, v11,v12,  M(r,10), M(r,11));
+        G(v2, v7, v8, v13,  M(r,12), M(r,13));
+        G(v3, v4, v9, v14,  M(r,14), M(r,15));
+    }
+
+    // feedforward
+    out_state[0]  = v0 ^ v8  ^ cv[0];
+    out_state[1]  = v1 ^ v9  ^ cv[1];
+    out_state[2]  = v2 ^ v10 ^ cv[2];
+    out_state[3]  = v3 ^ v11 ^ cv[3];
+    out_state[4]  = v4 ^ v12 ^ cv[4];
+    out_state[5]  = v5 ^ v13 ^ cv[5];
+    out_state[6]  = v6 ^ v14 ^ cv[6];
+    out_state[7]  = v7 ^ v15 ^ cv[7];
+    out_state[8]  = v8  ^ cv[0];
+    out_state[9]  = v9  ^ cv[1];
+    out_state[10] = v10 ^ cv[2];
+    out_state[11] = v11 ^ cv[3];
+    out_state[12] = v12 ^ cv[4];
+    out_state[13] = v13 ^ cv[5];
+    out_state[14] = v14 ^ cv[6];
+    out_state[15] = v15 ^ cv[7];
+}
 __device__ void g_words_from_little_endian_bytes(
     u8 *bytes, u32 *words, u32 bytes_len
 ) {

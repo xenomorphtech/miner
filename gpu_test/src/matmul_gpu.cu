@@ -3,6 +3,31 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
+// miner_ctrl.h
+#pragma once
+#include <stdint.h>
+
+struct __align__(64) MinerCtrl {
+  volatile uint64_t epoch;        // host increments to force all blocks to exit
+  volatile uint64_t start_nonce;  // base nonce
+  volatile int      stop;         // set 1 to stop gracefully
+  volatile uint32_t pad;          // padding
+};
+
+struct FoundResult {
+  int       seed_idx;
+  uint32_t  u32_at_228;
+  uint64_t  nonce;
+  uint8_t   hash32[32];
+  uint8_t   seed240[240];
+};
+
+// device ring meta (in device mem or mapped pinned)
+struct __align__(64) RingMeta {
+  volatile uint32_t head;   // atomic producer index
+  uint32_t          cap;    // capacity
+};
+
 /* Neutralize cudaDeviceSynchronize() when seen from device code inside
    the blaze3 kernel header (which calls it from a __global__ function). */
 #ifdef __CUDA_ARCH__
@@ -1006,4 +1031,275 @@ cudaEventCreate(&stop);
     return found;
 }
 
+#ifndef TILE_K
+#define TILE_K 256  // keep multiple of 64 and of 4
+#endif
 
+// Shared: As[16×TILE_K] + Bs[TILE_K×16] (dynamic), plus static shared for C and leaf state
+extern "C" __global__
+void miner_persistent_kernel(
+    const uint8_t* __restrict__ d_seed_bases,  // [batch × 240], bytes 232..239 will be replaced by nonce
+    int batch,
+    MinerCtrl* __restrict__ d_ctl,
+    RingMeta*  __restrict__ d_ring,
+    FoundResult* __restrict__ d_buf  // [d_ring->cap]
+) {
+    // Thread coords for 16x16 tile
+    const int i = threadIdx.y;  // row of C
+    const int j = threadIdx.x;  // col of C
+
+    // Dynamic shared for tiles
+    extern __shared__ __align__(16) uint8_t smem[];
+    uint8_t* As = smem;                           // 16*TILE_K
+    uint8_t* Bs = smem + (size_t)16*TILE_K;       // TILE_K*16
+
+    // Static shared
+    __shared__ int32_t  Csh[16*16];
+    __shared__ uint32_t precv[8], last_words[16];
+    __shared__ uint32_t last_len;
+    __shared__ uint8_t  seed_local[240];  // block-local seed copy
+    __shared__ uint32_t u32_at_228;       // for result
+
+    // Snapshot epoch we started with
+    const uint64_t my_epoch0 = d_ctl->epoch;
+
+    // Grid-stride over seeds, per block
+    for (int seed_idx_block = blockIdx.x; ; ) {
+        // Exit if epoch changed or stop requested
+        if (d_ctl->stop || d_ctl->epoch != my_epoch0) return;
+
+        // Each outer “round” increments nonce by gridDim.x to avoid overlap
+        // We also stride seeds by gridDim.x so any grid size works with any batch size.
+        for (int seed_idx = seed_idx_block; seed_idx < batch; seed_idx += gridDim.x) {
+
+            // ---------------- build seed (thread 0 does the small copy) ----------------
+            if (i==0 && j==0) {
+                const uint8_t* src = d_seed_bases + (size_t)seed_idx*240;
+                #pragma unroll
+                for (int k=0; k<240; ++k) seed_local[k] = src[k];
+
+                // compute this block’s nonce (grid-stride over nonces)
+                // base + blockIdx.x + many laps over time:
+                // to get variety per loop, we add a per-iteration salt from clock64()
+                uint64_t nonce = d_ctl->start_nonce + (uint64_t)blockIdx.x + (uint64_t)clock64();
+
+                // write LE into [232..239]
+                #pragma unroll
+                for (int b=0; b<8; ++b) seed_local[232+b] = (uint8_t)((nonce >> (8*b)) & 0xFF);
+
+                // read u32 at byte 228 for reporting
+                u32_at_228 = *reinterpret_cast<const uint32_t*>(&seed_local[228]);
+
+                // ---- compute pre-final CV + last words (serial; tiny vs GEMM) ----
+                uint32_t cv[8];
+                #pragma unroll
+                for (int w=0; w<8; ++w) cv[w] = g_IV[w];
+
+                // 240 bytes = 3*64 + 48
+                for (int blk=0; blk<4; ++blk) {
+                    const uint32_t blen = (blk==3) ? 48u : 64u;
+                    uint32_t m[16] = {0};
+                    #pragma unroll
+                    for (uint32_t t=0; t<blen; ++t)
+                        reinterpret_cast<uint8_t*>(m)[t] = seed_local[blk*64 + t];
+
+                    uint32_t flags = 0;
+                    if (blk==0) flags |= CHUNK_START;
+                    if (blk==3) flags |= (CHUNK_END | ROOT);
+
+                    if (blk==3) {
+                        #pragma unroll
+                        for (int w=0; w<8; ++w)  precv[w] = cv[w];
+                        #pragma unroll
+                        for (int w=0; w<16; ++w) last_words[w] = m[w];
+                        last_len = blen; // 48
+                    }
+
+                    uint32_t st[16];
+                    g_compress(cv, m, 0ULL, blen, flags, st);
+                    #pragma unroll
+                    for (int w=0; w<8; ++w) cv[w] = st[w];
+                }
+            }
+            __syncthreads();
+
+            // ---------------- fused XOF → GEMM (DP4A) into Csh[i*16+j] ----------------
+            {
+                constexpr int K = 50240;
+                constexpr int A_BYTES = 16 * K;         // 803,840
+                constexpr int A_BLOCKS = A_BYTES / 64;   // 12,560
+                constexpr int B_BASE_BLOCK = A_BLOCKS;   // 12,560
+
+                int acc   = 0;
+                int sum_b = 0;
+
+                for (int k0=0; k0<K; k0+=TILE_K) {
+                    const int tile = min(TILE_K, K - k0);
+
+                    // ---- fill A tile (per row, blocks of 64 bytes)
+                    const int a_blocks_per_row = (tile + 63) / 64;
+                    for (int rb = j; rb < a_blocks_per_row; rb += blockDim.x) {
+                        const int kk_base = rb*64;
+                        const uint32_t blkA = (uint32_t)(i * (K/64) + (k0/64) + rb);
+                        uint32_t words[16];
+                        xof_emit_words(blkA, /*root*/nullptr, precv, last_words, last_len, words);
+                        uint8_t* dst = As + (size_t)i*TILE_K + kk_base;
+                        uint32_t* dstw = reinterpret_cast<uint32_t*>(dst);
+                        #pragma unroll
+                        for (int w=0; w<16; ++w) dstw[w] = words[w];
+                    }
+
+                    // ---- fill B tile (groups of 4 k’s)
+                    const int b_blocks = (tile + 3) / 4;
+                    for (int gb = i; gb < b_blocks; gb += blockDim.y) {
+                        const int kk_base = gb * 4;
+                        const uint32_t blkB = (uint32_t)(B_BASE_BLOCK + ((k0 + kk_base) >> 2));
+                        uint32_t words[16];
+                        xof_emit_words(blkB, /*root*/nullptr, precv, last_words, last_len, words);
+                        const uint8_t* src = reinterpret_cast<const uint8_t*>(words);
+                        #pragma unroll
+                        for (int q=0; q<4; ++q) {
+                            const int kk = kk_base + q;
+                            if (kk < tile) {
+                                uint8_t* dst = Bs + (size_t)kk*16;
+                                reinterpret_cast<uint32_t*>(dst)[0] =
+                                    reinterpret_cast<const uint32_t*>(src + q*16)[0];
+                                reinterpret_cast<uint32_t*>(dst)[1] =
+                                    reinterpret_cast<const uint32_t*>(src + q*16)[1];
+                                reinterpret_cast<uint32_t*>(dst)[2] =
+                                    reinterpret_cast<const uint32_t*>(src + q*16)[2];
+                                reinterpret_cast<uint32_t*>(dst)[3] =
+                                    reinterpret_cast<const uint32_t*>(src + q*16)[3];
+                            }
+                        }
+                    }
+
+                    __syncthreads();
+
+                    // ---- DP4A on this tile (row i, col j)
+                    int kk=0;
+                    for (; kk+3<tile; kk+=4) {
+                        int a0 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 0]) - 128;
+                        int a1 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 1]) - 128;
+                        int a2 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 2]) - 128;
+                        int a3 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 3]) - 128;
+                        int a_packed =  (a0 & 0xFF)
+                                      | ((a1 & 0xFF)<<8)
+                                      | ((a2 & 0xFF)<<16)
+                                      | ((a3 & 0xFF)<<24);
+
+                        int b0 = (int)((int8_t)Bs[(size_t)(kk+0)*16 + j]);
+                        int b1 = (int)((int8_t)Bs[(size_t)(kk+1)*16 + j]);
+                        int b2 = (int)((int8_t)Bs[(size_t)(kk+2)*16 + j]);
+                        int b3 = (int)((int8_t)Bs[(size_t)(kk+3)*16 + j]);
+                        int b_packed =  (b0 & 0xFF)
+                                      | ((b1 & 0xFF)<<8)
+                                      | ((b2 & 0xFF)<<16)
+                                      | ((b3 & 0xFF)<<24);
+                        sum_b += b0 + b1 + b2 + b3;
+                        #if __CUDA_ARCH__ >= 610
+                          acc = __dp4a(a_packed, b_packed, acc);
+                        #else
+                          acc += a0*b0 + a1*b1 + a2*b2 + a3*b3;
+                        #endif
+                    }
+                    for (; kk<tile; ++kk) {
+                        int a_s = (int)((unsigned)As[(size_t)i*TILE_K + kk]) - 128;
+                        int b_s = (int)((int8_t)Bs[(size_t)kk*16 + j]);
+                        acc   += a_s * b_s;
+                        sum_b += b_s;
+                    }
+                    __syncthreads();
+                }
+
+                // Bias correction for (A_u8 - 128)
+                acc += 128 * sum_b;
+                Csh[i*16 + j] = acc;
+            }
+            __syncthreads();
+
+            // ---------------- block hashes seed||C and publishes winners -----------
+            if (i==0 && j==0) {
+                // BLAKE3(seed||C) with your two-chunk+parent path
+                uint32_t cv0[8]; for (int w=0; w<8; ++w) cv0[w] = g_IV[w];
+                uint32_t st[16];
+
+                // chunk 0: seed[0..239] + C[0..783]
+                for (int blk=0; blk<16; ++blk) {
+                    uint32_t m[16] = {0};
+                    for (int b=0; b<64; ++b) {
+                        int off = blk*64 + b; // within first 1024 bytes
+                        uint8_t val;
+                        if (off < 240) val = seed_local[off];
+                        else {
+                            // from Csh
+                            int c_off = off - 240;
+                            val = reinterpret_cast<uint8_t*>(Csh)[c_off];
+                        }
+                        reinterpret_cast<uint8_t*>(m)[b] = val;
+                    }
+                    uint32_t flags = 0;
+                    if (blk==0)  flags |= CHUNK_START;
+                    if (blk==15) flags |= CHUNK_END;
+                    g_compress(cv0, m, 0ULL, 64u, flags, st);
+                    for (int w=0; w<8; ++w) cv0[w] = st[w];
+                }
+
+                // chunk 1: C tail [784..1023] (240 bytes)
+                uint32_t cv1[8]; for (int w=0; w<8; ++w) cv1[w] = g_IV[w];
+                for (int blk=0; blk<4; ++blk) {
+                    uint32_t blen = (blk==3) ? 48u : 64u;
+                    uint32_t m[16] = {0};
+                    for (uint32_t b=0; b<blen; ++b) {
+                        reinterpret_cast<uint8_t*>(m)[b] =
+                            reinterpret_cast<uint8_t*>(Csh)[784 + blk*64 + b];
+                    }
+                    uint32_t flags = 0;
+                    if (blk==0) flags |= CHUNK_START;
+                    if (blk==3) flags |= CHUNK_END;
+                    g_compress(cv1, m, 1ULL, blen, flags, st);
+                    for (int w=0; w<8; ++w) cv1[w] = st[w];
+                }
+
+                // parent (ROOT)
+                uint32_t parent_in[16];
+                for (int w=0; w<8; ++w) parent_in[w]     = cv0[w];
+                for (int w=0; w<8; ++w) parent_in[8 + w] = cv1[w];
+                uint32_t cvp[8]; for (int w=0; w<8; ++w) cvp[w] = g_IV[w];
+                g_compress(cvp, parent_in, 0ULL, 64u, PARENT | ROOT, st);
+                uint8_t hash32[32];
+                for (int w=0; w<8; ++w)
+                    reinterpret_cast<uint32_t*>(hash32)[w] = st[w];
+
+                // Check difficulty: two 0x00 bytes + low nibble zero (same as before)
+                if (hash32[0]==0x00 && hash32[1]==0x00 && ((hash32[2]&0x0F)==0x00)) {
+                    // Publish to ring
+                    uint32_t slot = atomicAdd(const_cast<uint32_t*>(&d_ring->head), 1u);
+                    slot %= d_ring->cap; // ring overwrite if full (or handle separately)
+
+                    FoundResult r;
+                    r.seed_idx   = seed_idx;
+                    r.u32_at_228 = u32_at_228;
+                    // reconstruct nonce from seed tail (LE)
+                    uint64_t n=0; for (int b=0; b<8; ++b) n |= (uint64_t)seed_local[232+b] << (8*b);
+                    r.nonce = n;
+                    for (int b=0; b<32; ++b)  r.hash32[b]   = hash32[b];
+                    for (int b=0; b<240; ++b) r.seed240[b]  = seed_local[b];
+
+                    // store to device buffer
+                    d_buf[slot] = r;
+                    __threadfence();       // make visible to host/device readers
+                }
+            }
+
+            __syncthreads();
+
+            // Early exit if epoch changed during this seed
+            if (d_ctl->stop || d_ctl->epoch != my_epoch0) return;
+        }
+
+        // Advance to next seed stripe (wrap naturally)
+        seed_idx_block += gridDim.x;
+        if (seed_idx_block >= max(1, batch)) seed_idx_block -= max(1, batch);
+    }
+}
