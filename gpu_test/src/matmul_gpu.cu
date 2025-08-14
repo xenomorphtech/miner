@@ -530,7 +530,7 @@ __global__ void find_first_two_zeroes(
     if (idx >= batch) return;
 
     const uint8_t* h = d_hash32 + (size_t)idx * 32;
-    if ((h[0] == 0x00) && (h[1] == 0x00) && (h[2] == 0x00)) {
+    if ((h[0] == 0x00) && (h[1] == 0x00) && ((h[2] & 0xf) == 0x00)) {
         // claim "first"
         int old = atomicCAS(d_found_idx, -1, idx);
         if (old == -1) {
@@ -548,6 +548,120 @@ __global__ void find_first_two_zeroes(
         }
     }
 }
+#ifndef TILE_K
+#define TILE_K 256   // Good starting point; keep multiple of 32 (and 4)
+#endif
+
+// Shared tiles (byte-addressable). We will read them as int (packed 4x int8).
+// Align to 16 so packed reads are naturally aligned in shared memory.
+__global__ void matmul16x50240_u8_i8_dp4a_tiled(
+    const uint8_t* __restrict__ d_ab,  // A||B per seed (1,607,680 bytes)
+    size_t per_ab,
+    int32_t* __restrict__ d_C,         // 16*16 i32 per seed (256 i32)
+    int batch)
+{
+    const int i    = threadIdx.y; // 0..15
+    const int j    = threadIdx.x; // 0..15
+    const int seed = blockIdx.x;
+    if (seed >= batch || i >= 16 || j >= 16) return;
+
+    const int K = 50240;
+
+    const size_t A_BYTES = 16ull * 50240ull; // 803,840
+    const uint8_t* base = d_ab + (size_t)seed * per_ab;
+    const uint8_t* A = base;                 // [16 x 50240] row-major u8
+    const uint8_t* B = base + A_BYTES;       // [50240 x 16] row-major, interpret as i8
+
+    // Shared memory tiles: A[16 x TILE_K], B[TILE_K x 16]
+    extern __shared__ uint8_t smem[];
+    uint8_t* As = smem;                                    // 16*TILE_K bytes
+    uint8_t* Bs = smem + (size_t)16 * TILE_K;              // TILE_K*16 bytes
+
+    // Accumulators
+    int acc = 0;        // main dot product on signed int8 via dp4a
+    int sum_b = 0;      // sum of B's signed bytes for column j, for bias fix
+
+    // Strides
+    const size_t rowA = (size_t)i * (size_t)K;             // byte stride in A
+    // B is row-major: element (k,j) at B[k*16 + j]
+
+    // Loop over K in tiles of TILE_K
+    for (int k0 = 0; k0 < K; k0 += TILE_K) {
+        const int tile = min(TILE_K, K - k0);
+
+        // --- Load A tile rows into shared memory ---
+        // Each thread in the 16x16 block helps load both tiles in stripes.
+        // Load A row i for the current tile [k0 .. k0+tile)
+        for (int kk = threadIdx.x; kk < tile; kk += blockDim.x) {
+            As[i * TILE_K + kk] = A[rowA + (k0 + kk)];
+        }
+
+        // --- Load B tile rows into shared memory ---
+        // We want Bs[kk, j] = B[(k0 + kk), j]
+        for (int kk = threadIdx.y; kk < tile; kk += blockDim.y) {
+            Bs[kk * 16 + j] = B[((size_t)(k0 + kk) * 16) + j];
+        }
+
+        __syncthreads();
+
+        // --- Compute on the current tile with DP4A ---
+        // Process in groups of 4 so we can pack 4 int8 into a 32-bit int.
+        // For A: convert to signed by subtracting 128 before packing.
+        int kk = 0;
+        // Fast path: groups of 4
+        for (; kk + 3 < tile; kk += 4) {
+            // Pack 4 A bytes as signed (a_u8 - 128)
+            int a_packed;
+            {
+                // Shared is byte aligned; take 4 consecutive bytes and bias in registers.
+                // Read as bytes first:
+                int a0 = (int)((unsigned)As[i * TILE_K + kk + 0]) - 128;
+                int a1 = (int)((unsigned)As[i * TILE_K + kk + 1]) - 128;
+                int a2 = (int)((unsigned)As[i * TILE_K + kk + 2]) - 128;
+                int a3 = (int)((unsigned)As[i * TILE_K + kk + 3]) - 128;
+                // Pack into little-endian 4× int8 in a 32-bit int
+                a_packed  = ((a0 & 0xFF)) |
+                            ((a1 & 0xFF) << 8) |
+                            ((a2 & 0xFF) << 16) |
+                            ((a3 & 0xFF) << 24);
+            }
+
+            // Pack 4 B bytes as signed
+            int b_packed;
+            {
+                int b0 = (int)((int8_t)Bs[(kk + 0) * 16 + j]);
+                int b1 = (int)((int8_t)Bs[(kk + 1) * 16 + j]);
+                int b2 = (int)((int8_t)Bs[(kk + 2) * 16 + j]);
+                int b3 = (int)((int8_t)Bs[(kk + 3) * 16 + j]);
+                b_packed  = ((b0 & 0xFF)) |
+                            ((b1 & 0xFF) << 8) |
+                            ((b2 & 0xFF) << 16) |
+                            ((b3 & 0xFF) << 24);
+                // Accumulate sum_b at the same time (sum of signed bytes)
+                sum_b += b0 + b1 + b2 + b3;
+            }
+
+            // 4-way int8 dot product (signed) + accumulate
+            acc = __dp4a(a_packed, b_packed, acc);
+        }
+
+        // Handle the (at most) 3 leftover bytes in this tile
+        for (; kk < tile; ++kk) {
+            int a_s = (int)((unsigned)As[i * TILE_K + kk]) - 128;
+            int b_s = (int)((int8_t)Bs[kk * 16 + j]);
+            acc    += a_s * b_s;
+            sum_b  += b_s;
+        }
+
+        __syncthreads();
+    }
+
+    // Bias correction for (a_u8 - 128) transform
+    acc += 128 * sum_b;
+
+    d_C[(size_t)seed * 256 + (size_t)i * 16 + j] = acc;
+}
+
 // Searches for the first hash (of seed||C) that starts with two 0x00 bytes.
 // Assumptions:
 // - Nonce is stored LE in seed bytes [232..239] (last 8 bytes).
@@ -678,7 +792,12 @@ cudaEventCreate(&stop);
             d_ab, AB_BYTES, batch);
 
         // 3) GEMM C = A * B
-        matmul16x50240_u8_i8<<<gemm_grd, gemm_blk, 0, s>>>(d_ab, AB_BYTES, d_C, batch);
+    dim3 blk(16, 16, 1);
+    dim3 grd(batch, 1, 1);
+    size_t smem_bytes = (size_t)16 * TILE_K + (size_t)TILE_K * 16; // bytes
+    // we declared As and Bs as uint8_t, so smem size is exactly that
+    matmul16x50240_u8_i8_dp4a_tiled<<<grd, blk, smem_bytes, s>>>(d_ab, AB_BYTES, d_C, batch);
+
 
         // 4) Hash seed||C -> 32B
         blake3_hash_seed_plus_c<<<blocksB, threads, 0, s>>>(
@@ -710,7 +829,7 @@ cudaEventCreate(&stop);
         // Pull flag to host
         int h_idx = -1;
         cudaMemcpyAsync(&h_idx, d_found_idx, sizeof(int), cudaMemcpyDeviceToHost, s);
-        cudaStreamSynchronize(s);
+        //cudaStreamSynchronize(s);
 
 
         if (h_idx != -1) {
