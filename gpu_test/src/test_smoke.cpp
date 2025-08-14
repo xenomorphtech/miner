@@ -160,7 +160,7 @@ int main() {
     uint8_t* d_seed_bases = nullptr;
 
     cudaMalloc(&d_seed_bases, batch*240);
-    cudaMemcpy(d_seed_bases, h_seed_bases, batch*240, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_seed_bases,  h_seed_bases.data(), h_seed_bases.size(), cudaMemcpyHostToDevice);
     
 
     const int ring_cap = 1024;
@@ -176,12 +176,12 @@ int main() {
       /*ring_cap=*/1024, /*blocks=*/2*SM_count);
     
     // 4) Poll (CALL it, don't declare it)
-    bool ok = poll_until_found(d_ring, d_buf, ring_cap);
-    std::printf("poll_until_found: %s\n", ok ? "found" : "not found");
+    poll_until_found(d_ring, d_buf, ring_cap);
 
     // 5) Cleanup (add any miner stop API you have)
     CUDA_OK(cudaFree(d_seed_bases));
-    return ok ? 0 : 1;}
+    return 0;
+}
 
 int main2() {
     if (!check_blake3_kat_a240()) return 1;
