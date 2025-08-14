@@ -98,7 +98,7 @@ int main() {
     if (!check_blake3_kat_a240()) return 1;
 
     // Step 2: Proceed with your existing GPU vs CPU smoke test
-    const size_t BATCH = 1 << 13; // small for first run
+    const size_t BATCH = 1 << 13; 
     std::vector<uint8_t> h_seeds(BATCH * 240);
     
     //std::mt19937_64 rng(123);

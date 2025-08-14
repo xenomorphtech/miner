@@ -104,30 +104,6 @@ __global__ void xof_expand(const u32* __restrict__ d_roots,
     #pragma unroll
     for (int w=0; w<8; ++w) dstw[w] = out[w];
 
-    // Upper 32B selection (debug modes for blk0; otherwise spec)
-    if (blk == 0) {
-        if      (g_xof_layout.b0_mode == 1) { // tmpL
-            #pragma unroll
-            for (int w=0; w<8; ++w) dstw[w+8] = out[w];
-            return;
-        } else if (g_xof_layout.b0_mode == 2) { // tmpH
-            #pragma unroll
-            for (int w=0; w<8; ++w) dstw[w+8] = out[w+8];
-            return;
-        } else if (g_xof_layout.b0_mode == 3) { // rootcmpL
-            #pragma unroll
-            for (int w=0; w<8; ++w) dstw[w+8] = out[w];
-            return;
-        } else if (g_xof_layout.b0_mode == 4) { // rootcmpH
-            #pragma unroll
-            for (int w=0; w<8; ++w) dstw[w+8] = out[w+8];
-            return;
-        } else if (g_xof_layout.b0_mode == 5) { // rootcmpH ^ precv  (spec upper)
-            #pragma unroll
-            for (int w=0; w<8; ++w) dstw[w+8] = out[w+8] ^ precv[w];
-            return;
-        }
-    }
 
     // Default/spec upper: hi ^ precv
     #pragma unroll
@@ -661,6 +637,186 @@ __global__ void matmul16x50240_u8_i8_dp4a_tiled(
 
     d_C[(size_t)seed * 256 + (size_t)i * 16 + j] = acc;
 }
+// --- Emit one 64B XOF block into 16 u32 words (dstw) ---
+// Mirrors xof_expand: low 32B = out[0..7]; upper 32B = hi (^precv by default)
+// Handles debug g_xof_layout.xof_flag_mode and b0_mode the same way.
+__device__ inline void xof_emit_words(
+    uint32_t blk,                     // 0..25119 within this seed
+    const u32 root[8],                // for debug DERIVE_KEY_MATERIAL path
+    const u32 precv[8],
+    const u32 last_words[16],
+    u32 last_len,
+    u32 dstw[16])                     // out words to write (64 bytes)
+{
+    u32 out[16];
+
+    const uint64_t t = (uint64_t)blk + (uint64_t)g_xof_layout.counter_offset;
+
+    if (g_xof_layout.xof_flag_mode == 1) {
+        // --- DEBUG: legacy DERIVE_KEY_MATERIAL path ---
+        u32 cv[8]; 
+        #pragma unroll
+        for (int i=0;i<8;++i) cv[i]=root[i];
+        u32 m[16] = {0}; m[15] = DERIVE_KEY_MATERIAL;
+        g_compress(cv, m, t, 64u, DERIVE_KEY_MATERIAL, out);
+        #pragma unroll
+        for (int w=0; w<16; ++w) dstw[w] = out[w];
+        return;
+    }
+
+    // --- SPEC path: recompress final leaf at counter t
+    recompress_final_leaf(precv, last_words, last_len, t, out);
+
+    // Low 32B
+    #pragma unroll
+    for (int w=0; w<8; ++w) dstw[w] = out[w];
+
+    // Default/spec upper: hi ^ precv
+    #pragma unroll
+    for (int w=0; w<8; ++w) dstw[8+w] = out[8+w] ^ precv[w];
+}
+
+#ifndef TILE_K
+#define TILE_K 256  // multiple of 64 and 4
+#endif
+
+// Shared memory is byte-addressable but 16B-aligned for packed u32 writes.
+__global__ void matmul16x50240_u8_i8_dp4a_fused_xof(
+    const u32* __restrict__ d_roots,       // [batch x 8]
+    const u32* __restrict__ d_precv,       // [batch x 8]
+    const u32* __restrict__ d_last_words,  // [batch x 16]
+    const uint8_t* __restrict__ d_last_len,// [batch]
+    int32_t* __restrict__ d_C,             // [batch x 16 x 16] i32
+    int batch)
+{
+    const int i    = threadIdx.y;  // 0..15 row of C
+    const int j    = threadIdx.x;  // 0..15 col of C
+    const int seed = blockIdx.x;
+    if (seed >= batch || i >= 16 || j >= 16) return;
+
+    // Pointers for this seed
+    const u32* root   = d_roots      + (size_t)seed * 8;
+    const u32* precv  = d_precv      + (size_t)seed * 8;
+    const u32* lwords = d_last_words + (size_t)seed * 16;
+    const u32  llen   = d_last_len[seed];
+
+    // Matrix shape
+    constexpr int K = 50240;
+    constexpr int A_BYTES = 16 * K;    // 803,840
+    constexpr int A_BLOCKS = A_BYTES / 64; // 12,560
+    constexpr int B_BASE_BLOCK = A_BLOCKS; // 12,560
+
+    // Shared memory layout: As[16×TILE_K] || Bs[TILE_K×16]
+    extern __shared__ __align__(16) uint8_t smem[];
+    uint8_t* As = smem;                             // 16*TILE_K bytes
+    uint8_t* Bs = smem + (size_t)16 * TILE_K;       // TILE_K*16 bytes
+
+    // Accumulators
+    int acc   = 0;
+    int sum_b = 0;  // for bias fix when casting A_u8->(A_s8 = A_u8 - 128)
+
+    // Process K in tiles of TILE_K
+    for (int k0 = 0; k0 < K; k0 += TILE_K) {
+        const int tile = min(TILE_K, K - k0);
+
+        // --------- Generate A tile: 16 rows × (tile/64) blocks per row ----------
+        // Each block produces 64 bytes for a given row and 64 consecutive k's.
+        const int a_blocks_per_row = (tile + 63) / 64;   // usually TILE_K/64
+        for (int ri = i; ri < 16; ri += blockDim.y) {
+            for (int rb = j; rb < a_blocks_per_row; rb += blockDim.x) {
+                const int kk_base = rb * 64;             // within tile
+                // blk index inside AB stream:
+                // blkA = ri*(K/64) + (k0/64) + rb
+                const uint32_t blkA = (uint32_t)(ri * (K/64) + (k0/64) + rb);
+                u32 words[16];
+                xof_emit_words(blkA, root, precv, lwords, llen, words);
+
+                // Write 64 bytes into As[ri, kk_base..kk_base+63]
+                uint8_t* dst = As + (size_t)ri * TILE_K + kk_base;
+                // words are little-endian; store as 16 u32
+                u32* dstw = reinterpret_cast<u32*>(dst);
+                #pragma unroll
+                for (int w=0; w<16; ++w) dstw[w] = words[w];
+            }
+        }
+
+        // --------- Generate B tile: (tile/4) blocks, shared across all columns ---
+        // For each group of 4 consecutive k's, one 64B block covers all 16 columns.
+        const int b_blocks = (tile + 3) / 4;            // usually TILE_K/4
+        for (int gb = i; gb < b_blocks; gb += blockDim.y) {
+            // kk_base in [0..tile), step 4
+            const int kk_base = gb * 4;
+            // blkB = B_BASE_BLOCK + ((k0 + kk_base) * 16) / 64
+            //      = 12560 + (k0 + kk_base)/4
+            const uint32_t blkB = (uint32_t)(B_BASE_BLOCK + ((k0 + kk_base) >> 2));
+            u32 words[16];
+            xof_emit_words(blkB, root, precv, lwords, llen, words);
+
+            // Copy the 64 bytes into Bs rows: four chunks of 16 bytes
+            const uint8_t* src = reinterpret_cast<const uint8_t*>(words);
+            #pragma unroll
+            for (int q=0; q<4; ++q) {
+                const int kk = kk_base + q;
+                if (kk < tile) {
+                    uint8_t* dst = Bs + (size_t)kk * 16;
+                    // 16 bytes: copy 4 u32
+                    reinterpret_cast<u32*>(dst)[0] =
+                        reinterpret_cast<const u32*>(src + q*16)[0];
+                    reinterpret_cast<u32*>(dst)[1] =
+                        reinterpret_cast<const u32*>(src + q*16)[1];
+                    reinterpret_cast<u32*>(dst)[2] =
+                        reinterpret_cast<const u32*>(src + q*16)[2];
+                    reinterpret_cast<u32*>(dst)[3] =
+                        reinterpret_cast<const u32*>(src + q*16)[3];
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // ----------------- Compute C[i,j] on this tile via DP4A -----------------
+        int kk = 0;
+        // fast path in groups of 4 for dp4a
+        for (; kk + 3 < tile; kk += 4) {
+            // pack 4 A bytes from As row i, subtract 128 to convert to signed
+            int a0 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 0]) - 128;
+            int a1 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 1]) - 128;
+            int a2 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 2]) - 128;
+            int a3 = (int)((unsigned)As[(size_t)i*TILE_K + kk + 3]) - 128;
+            int a_packed =  (a0 & 0xFF)
+                          | ((a1 & 0xFF) << 8)
+                          | ((a2 & 0xFF) << 16)
+                          | ((a3 & 0xFF) << 24);
+
+            // pack 4 B signed bytes from Bs column j
+            int b0 = (int)((int8_t)Bs[(size_t)(kk + 0) * 16 + j]);
+            int b1 = (int)((int8_t)Bs[(size_t)(kk + 1) * 16 + j]);
+            int b2 = (int)((int8_t)Bs[(size_t)(kk + 2) * 16 + j]);
+            int b3 = (int)((int8_t)Bs[(size_t)(kk + 3) * 16 + j]);
+            int b_packed =  (b0 & 0xFF)
+                          | ((b1 & 0xFF) << 8)
+                          | ((b2 & 0xFF) << 16)
+                          | ((b3 & 0xFF) << 24);
+
+            sum_b += b0 + b1 + b2 + b3;
+            acc = __dp4a(a_packed, b_packed, acc);
+        }
+        // leftovers (<=3)
+        for (; kk < tile; ++kk) {
+            int a_s = (int)((unsigned)As[(size_t)i*TILE_K + kk]) - 128;
+            int b_s = (int)((int8_t)Bs[(size_t)kk * 16 + j]);
+            acc   += a_s * b_s;
+            sum_b += b_s;
+        }
+
+        __syncthreads();
+    }
+
+    // Bias correction to undo (A_u8 -> A_s8 = A_u8 - 128)
+    acc += 128 * sum_b;
+
+    d_C[(size_t)seed * 256 + (size_t)i * 16 + j] = acc;
+}
 
 // Searches for the first hash (of seed||C) that starts with two 0x00 bytes.
 // Assumptions:
@@ -787,17 +943,15 @@ cudaEventCreate(&stop);
         }
 
         // 2) XOF expand -> A||B
-        xof_expand<<<xof_grd, xof_blk, 0, s>>>(
-            d_roots, d_precv, d_last_words, d_last_len,
-            d_ab, AB_BYTES, batch);
-
-        // 3) GEMM C = A * B
+       // 3) GEMM C = A * B
+{
     dim3 blk(16, 16, 1);
     dim3 grd(batch, 1, 1);
-    size_t smem_bytes = (size_t)16 * TILE_K + (size_t)TILE_K * 16; // bytes
-    // we declared As and Bs as uint8_t, so smem size is exactly that
-    matmul16x50240_u8_i8_dp4a_tiled<<<grd, blk, smem_bytes, s>>>(d_ab, AB_BYTES, d_C, batch);
-
+    size_t smem_bytes = (size_t)16 * TILE_K + (size_t)TILE_K * 16;
+    matmul16x50240_u8_i8_dp4a_fused_xof<<<grd, blk, smem_bytes, s>>>(
+        d_roots, d_precv, d_last_words, d_last_len,
+        d_C, batch);
+}
 
         // 4) Hash seed||C -> 32B
         blake3_hash_seed_plus_c<<<blocksB, threads, 0, s>>>(
@@ -851,3 +1005,5 @@ cudaEventCreate(&stop);
     cudaFree(d_found_nonce);
     return found;
 }
+
+
