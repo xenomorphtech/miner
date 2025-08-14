@@ -7,6 +7,7 @@
 #include <cstring>
 #include "../blake3/c/blake3.h"
 #include "miner_ctrl.h"
+#include <algorithm>
 
 extern "C" __global__
 void miner_persistent_kernel(
@@ -138,20 +139,53 @@ void start_persistent_miner(
     cudaStream_t s = 0);
 
 int main() {
-uint64_t batch = 1 << 13;
-int SM_count = 128;
-uint8_t* d_seed_bases = nullptr;
-cudaMalloc(&d_seed_bases, batch*240);
-cudaMemcpy(d_seed_bases, h_seed_bases, batch*240, cudaMemcpyHostToDevice);
+    uint64_t batch = 1 << 13;
+    int SM_count = 128;
+    uint8_t* d_seed_bases = nullptr;
+    cudaMalloc(&d_seed_bases, batch*240);
+    cudaMemcpy(d_seed_bases, h_seed_bases, batch*240, cudaMemcpyHostToDevice);
+    
 
-// 2) Start miner
-MinerCtrl *d_ctl; RingMeta *d_ring; FoundResult *d_buf;
-start_persistent_miner(d_seed_bases, batch, &d_ctl, &d_ring, &d_buf,
-  /*ring_cap=*/1024, /*blocks=*/min(batch, 2*SM_count));
+    uint8_t* d_seed_bases = nullptr;
+    CUDA_OK(cudaMalloc(&d_seed_bases, h_seed_bases.size()));
+    CUDA_OK(cudaMemcpy(d_seed_bases,
+                       h_seed_bases.data(),
+                       h_seed_bases.size(),
+                       cudaMemcpyHostToDevice));
 
-poll_until_found(RingMeta* d_ring, FoundResult* d_buf, int ring_cap)
 
-}
+   MinerCtrl *d_ctl = nullptr;
+    RingMeta  *d_ring = nullptr;
+    FoundResult *d_buf = nullptr;
+
+    const int ring_cap = 1024;
+    // Use std::min with matching types; grid blocks is an int.
+    int blocks = static_cast<int>(std::min<uint64_t>(batch, static_cast<uint64_t>(2 * SM_count)));
+
+  std::vector<uint8_t> h_seed_bases(batch * 240);
+    // TODO: fill with your real 240-byte bases per item
+    std::memset(h_seed_bases.data(), 0, h_seed_bases.size());
+    
+
+    // 3) Start miner
+    MinerCtrl *d_ctl = nullptr;
+    RingMeta  *d_ring = nullptr;
+    FoundResult *d_buf = nullptr;
+
+    const int ring_cap = 1024;
+    // Use std::min with matching types; grid blocks is an int.
+    int blocks = static_cast<int>(std::min<uint64_t>(batch, static_cast<uint64_t>(2 * SM_count)));
+
+    start_persistent_miner(d_seed_bases, batch, &d_ctl, &d_ring, &d_buf,
+      /*ring_cap=*/1024, /*blocks=*/min(batch, 2*SM_count));
+    
+    // 4) Poll (CALL it, don't declare it)
+    bool ok = poll_until_found(d_ring, d_buf, ring_cap);
+    std::printf("poll_until_found: %s\n", ok ? "found" : "not found");
+
+    // 5) Cleanup (add any miner stop API you have)
+    CUDA_OK(cudaFree(d_seed_bases));
+    return ok ? 0 : 1;}
 
 int main2() {
     if (!check_blake3_kat_a240()) return 1;
