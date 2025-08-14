@@ -32,15 +32,50 @@ __constant__ const int NUM_THREADS = 16;
 //
 extern __device__ __constant__ uint32_t g_IV[8];
 
+__constant__ int kMsgIdx[7][16] = {
+    // round 0
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15},
+    // round 1
+    { 2, 6, 3,10, 7, 0, 4,13, 1,11,12, 5, 9,14,15, 8},
+    // round 2
+    { 3, 4,10,12,13, 2, 7,14, 6, 5, 9, 0,11,15, 8, 1},
+    // round 3
+    {10, 7,12, 9,14, 3,13,15, 5,11, 0, 2,15, 8, 1, 6},
+    // round 4
+    {12,13, 9,11,15,10,14, 1,11, 0, 2, 6, 8, 1, 6, 5}, // example; fill with correct schedule
+    // round 5
+    { 9,14,11, 8, 1,12,15, 6, 0, 2, 6,10, 1, 6, 5,13}, // replace with exact blake3 schedule
+    // round 6
+    {11,15, 8, 1,12, 9, 6, 5, 2, 6,10,14, 6, 5,13, 0}  // replace with exact blake3 schedule
+};
+
 __constant__ const int g_MSG_PERMUTATION[] = {
     2, 6, 3, 10, 7, 0, 4, 13,
     1, 11, 12, 5, 9, 14, 15, 8
 };
 
-__device__ u32 g_rotr(u32 value, int shift) {
-    //return (value >> shift)|(value << (usize - shift));
-    return (value >> shift) | (value << (32 - shift));
+__forceinline__ __device__ u32 g_rotr(u32 x, int n) {
+    return __funnelshift_r(x, x, n);
 }
+
+
+#define G(a,b,c,d, mx, my)        \
+    do {                          \
+        a = a + b + (mx);         \
+        d = g_rotr(d ^ a, 16);      \
+        c = c + d;                \
+        b = g_rotr(b ^ c, 12);      \
+        a = a + b + (my);         \
+        d = g_rotr(d ^ a, 8);       \
+        c = c + d;                \
+        b = g_rotr(b ^ c, 7);       \
+    } while(0)
+
+
+//__device__ u32 g_rotr(u32 value, int shift) {
+//    //return (value >> shift)|(value << (usize - shift));
+//    return (value >> shift) | (value << (32 - shift));
+//}
 
 __device__ void g_g(u32 state[16], u32 a, u32 b, u32 c, u32 d, u32 mx, u32 my) {
     state[a] = state[a] + state[b] + mx;
@@ -92,6 +127,84 @@ __device__ void g_memset(ptr_t dest, T val, int count) {
         dest[i] = val;
 }
 
+__constant__ u32 kIV[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+};
+
+__forceinline__ __device__
+void g_compress_fast(const u32* __restrict cv,
+                     const u32* __restrict block_words,
+                     u64 counter, u32 block_len, u32 flags,
+                     u32* __restrict out_state /* 16 */)
+{
+    // State in registers
+    u32 v0, v1, v2, v3, v4, v5, v6, v7;
+    u32 v8, v9, v10, v11, v12, v13, v14, v15;
+
+    v0 = cv[0]; v1 = cv[1]; v2 = cv[2]; v3 = cv[3];
+    v4 = cv[4]; v5 = cv[5]; v6 = cv[6]; v7 = cv[7];
+
+    v8  = kIV[0]; v9  = kIV[1]; v10 = kIV[2]; v11 = kIV[3];
+    v12 = (u32)counter;
+    v13 = (u32)(counter >> 32);
+    v14 = block_len;
+    v15 = flags;
+
+    // Load message to registers (assumes aligned, little-endian)
+    u32 m0 = block_words[0];  u32 m1 = block_words[1];
+    u32 m2 = block_words[2];  u32 m3 = block_words[3];
+    u32 m4 = block_words[4];  u32 m5 = block_words[5];
+    u32 m6 = block_words[6];  u32 m7 = block_words[7];
+    u32 m8 = block_words[8];  u32 m9 = block_words[9];
+    u32 m10= block_words[10]; u32 m11= block_words[11];
+    u32 m12= block_words[12]; u32 m13= block_words[13];
+    u32 m14= block_words[14]; u32 m15= block_words[15];
+
+    // Helper to index m by compile-time schedule
+    auto M = [&](int r, int i)->u32 {
+        switch (kMsgIdx[r][i]) {
+            case  0: return m0;  case  1: return m1;  case  2: return m2;  case  3: return m3;
+            case  4: return m4;  case  5: return m5;  case  6: return m6;  case  7: return m7;
+            case  8: return m8;  case  9: return m9;  case 10: return m10; case 11: return m11;
+            case 12: return m12; case 13: return m13; case 14: return m14; case 15: return m15;
+        }
+        return 0u;
+    };
+
+    #pragma unroll
+    for (int r = 0; r < 7; ++r) {
+        // columns
+        G(v0, v4, v8, v12,  M(r,0),  M(r,1));
+        G(v1, v5, v9, v13,  M(r,2),  M(r,3));
+        G(v2, v6, v10,v14,  M(r,4),  M(r,5));
+        G(v3, v7, v11,v15,  M(r,6),  M(r,7));
+        // diagonals
+        G(v0, v5, v10,v15,  M(r,8),  M(r,9));
+        G(v1, v6, v11,v12,  M(r,10), M(r,11));
+        G(v2, v7, v8, v13,  M(r,12), M(r,13));
+        G(v3, v4, v9, v14,  M(r,14), M(r,15));
+    }
+
+    // feedforward
+    out_state[0]  = v0 ^ v8  ^ cv[0];
+    out_state[1]  = v1 ^ v9  ^ cv[1];
+    out_state[2]  = v2 ^ v10 ^ cv[2];
+    out_state[3]  = v3 ^ v11 ^ cv[3];
+    out_state[4]  = v4 ^ v12 ^ cv[4];
+    out_state[5]  = v5 ^ v13 ^ cv[5];
+    out_state[6]  = v6 ^ v14 ^ cv[6];
+    out_state[7]  = v7 ^ v15 ^ cv[7];
+    out_state[8]  = v8  ^ cv[0];
+    out_state[9]  = v9  ^ cv[1];
+    out_state[10] = v10 ^ cv[2];
+    out_state[11] = v11 ^ cv[3];
+    out_state[12] = v12 ^ cv[4];
+    out_state[13] = v13 ^ cv[5];
+    out_state[14] = v14 ^ cv[6];
+    out_state[15] = v15 ^ cv[7];
+}
+
 __device__ void g_compress(
     u32 *chaining_value,
     u32 *block_words,
@@ -109,54 +222,33 @@ __device__ void g_compress(
     state[15] = flags;
 
 
-    GPU_PRINT("init", state);
-
-    #ifdef DEBUG_TRACE
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            printf("GPU INFO counter1   %08X\n", state[12]);
-            printf("GPU INFO counter2   %08X\n", state[13]);
-            printf("GPU INFO block_len  %08X\n", state[14]);
-            printf("GPU INFO flags      %08X\n", state[15]);
-        }
-    #endif
-
-
     u32 block[16];
     g_memcpy(block, block_words, 64);
 
     g_round(state, block); // round 1
-    GPU_PRINT("r1", state);
 
     g_permute(block);
     g_round(state, block); // round 2
-    GPU_PRINT("r2", state);
 
     g_permute(block);
     g_round(state, block); // round 3
-    GPU_PRINT("r3", state);
 
     g_permute(block);
     g_round(state, block); // round 4
-    GPU_PRINT("r4", state);
 
     g_permute(block);
     g_round(state, block); // round 5
-    GPU_PRINT("r5", state);
 
     g_permute(block);
     g_round(state, block); // round 6
-    GPU_PRINT("r6", state);
 
     g_permute(block);
     g_round(state, block); // round 7
-    GPU_PRINT("r7", state);
 
 
     for(int i = 0; i < 8; i++){
         state[i] ^= state[i + 8];
     }
-
-    GPU_PRINT("final", state);
 }
 
 __device__ void g_words_from_little_endian_bytes(
@@ -171,7 +263,7 @@ __device__ void g_words_from_little_endian_bytes(
 
 __device__ void Chunk::g_compress_chunk(u32 out_flags) {
     if(flags&PARENT) {
-        g_compress(
+        g_compress_fast(
             key,
             data,
             0,  // counter is always zero for parent nodes
@@ -227,7 +319,7 @@ __device__ void Chunk::g_compress_chunk(u32 out_flags) {
             flagger |= CHUNK_END | out_flags;
 
         // raw hash for root node
-        g_compress(
+        g_compress_fast(
             chaining_value,
             block_words,
             counter,

@@ -2,31 +2,7 @@
 #include <assert.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
-
-// miner_ctrl.h
-#pragma once
-#include <stdint.h>
-
-struct __align__(64) MinerCtrl {
-  volatile uint64_t epoch;        // host increments to force all blocks to exit
-  volatile uint64_t start_nonce;  // base nonce
-  volatile int      stop;         // set 1 to stop gracefully
-  volatile uint32_t pad;          // padding
-};
-
-struct FoundResult {
-  int       seed_idx;
-  uint32_t  u32_at_228;
-  uint64_t  nonce;
-  uint8_t   hash32[32];
-  uint8_t   seed240[240];
-};
-
-// device ring meta (in device mem or mapped pinned)
-struct __align__(64) RingMeta {
-  volatile uint32_t head;   // atomic producer index
-  uint32_t          cap;    // capacity
-};
+#include "miner_ctrl.h"
 
 /* Neutralize cudaDeviceSynchronize() when seen from device code inside
    the blaze3 kernel header (which calls it from a __global__ function). */
@@ -1302,4 +1278,63 @@ void miner_persistent_kernel(
         seed_idx_block += gridDim.x;
         if (seed_idx_block >= max(1, batch)) seed_idx_block -= max(1, batch);
     }
+}
+
+
+extern "C"
+void start_persistent_miner(
+    const uint8_t* d_seed_bases, int batch,
+    MinerCtrl** d_ctl_out,
+    RingMeta**  d_ring_out,
+    FoundResult** d_buf_out,
+    int ring_cap,
+    int blocks,                      // e.g. 2*SM or min(batch, 4096)
+    cudaStream_t s = 0)
+{
+    // Control
+    MinerCtrl hctl{};
+    hctl.epoch = 1;
+    hctl.start_nonce = 0;
+    hctl.stop  = 0;
+
+    MinerCtrl* d_ctl=nullptr;
+    cudaMalloc(&d_ctl, sizeof(MinerCtrl));
+    cudaMemcpyAsync(d_ctl, &hctl, sizeof(hctl), cudaMemcpyHostToDevice, s);
+
+    // Ring
+    RingMeta  *d_ring=nullptr;
+    FoundResult *d_buf=nullptr;
+    cudaMalloc(&d_ring, sizeof(RingMeta));
+    cudaMalloc(&d_buf,  ring_cap * sizeof(FoundResult));
+    RingMeta hr{}; hr.head = 0; hr.cap = ring_cap;
+    cudaMemcpyAsync(d_ring, &hr, sizeof(hr), cudaMemcpyHostToDevice, s);
+
+    // Launch kernel
+    dim3 blk(16,16,1);
+    dim3 grd(blocks,1,1);
+    size_t smem = (size_t)16*TILE_K + (size_t)TILE_K*16; // bytes
+    miner_persistent_kernel<<<grd, blk, smem, s>>>(d_seed_bases, batch, d_ctl, d_ring, d_buf);
+
+    *d_ctl_out  = d_ctl;
+    *d_ring_out = d_ring;
+    *d_buf_out  = d_buf;
+}
+
+// Drain up to N results (non-blocking). Returns how many were read.
+extern "C"
+int drain_results(RingMeta* d_ring, FoundResult* d_buf, int ring_cap,
+                  std::vector<FoundResult>& out)
+{
+    RingMeta hr{};
+    cudaMemcpy(&hr, d_ring, sizeof(hr), cudaMemcpyDeviceToHost);
+    const uint32_t count = min(hr.head, (uint32_t)ring_cap);
+    if (count == 0) return 0;
+
+    out.resize(count);
+    cudaMemcpy(out.data(), d_buf, count*sizeof(FoundResult), cudaMemcpyDeviceToHost);
+
+    // Reset head to 0 after drain (simple model). You can also do partial drains.
+    RingMeta zero{0u, (uint32_t)ring_cap};
+    cudaMemcpy(d_ring, &zero, sizeof(zero), cudaMemcpyHostToDevice);
+    return (int)count;
 }

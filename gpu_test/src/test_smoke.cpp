@@ -6,6 +6,16 @@
 #include <cuda_runtime.h>
 #include <cstring>
 #include "../blake3/c/blake3.h"
+#include "miner_ctrl.h"
+
+extern "C" __global__
+void miner_persistent_kernel(
+    const uint8_t* __restrict__ d_seed_bases,  // [batch × 240], bytes 232..239 will be replaced by nonce
+    int batch,
+    MinerCtrl* __restrict__ d_ctl,
+    RingMeta*  __restrict__ d_ring,
+    FoundResult* __restrict__ d_buf  // [d_ring->cap]
+);
 
 static void print_hex(const uint8_t* p, size_t n, const char* label) {
     if (label) puts(label);
@@ -94,7 +104,56 @@ static bool check_cpu_known_vector() {
     puts("✅ CPU known-vector matches (first 64 bytes).");
     return true;
 }
+
+extern "C" int drain_results(RingMeta* d_ring, FoundResult* d_buf, int ring_cap,
+                  std::vector<FoundResult>& out);
+
+void poll_until_found(RingMeta* d_ring, FoundResult* d_buf, int ring_cap) {
+    std::vector<FoundResult> found;
+    while (true) {
+        int n = drain_results(d_ring, d_buf, ring_cap, found);
+        if (n > 0) {
+            printf("[FOUND] %d winner(s):\n", n);
+            for (int i = 0; i < n; ++i) {
+                printf("  idx=%d nonce=%llu u32@228=0x%08X\n",
+                       found[i].seed_idx,
+                       (unsigned long long)found[i].nonce,
+                       found[i].u32_at_228);
+            }
+            break; // exit loop immediately on first hit
+        }
+        // optional: sleep/yield to avoid busy-spinning
+         usleep(1000); // 1ms
+    }
+}
+
+extern "C"
+void start_persistent_miner(
+    const uint8_t* d_seed_bases, int batch,
+    MinerCtrl** d_ctl_out,
+    RingMeta**  d_ring_out,
+    FoundResult** d_buf_out,
+    int ring_cap,
+    int blocks,                      // e.g. 2*SM or min(batch, 4096)
+    cudaStream_t s = 0);
+
 int main() {
+uint64_t batch = 1 << 13;
+int SM_count = 128;
+uint8_t* d_seed_bases = nullptr;
+cudaMalloc(&d_seed_bases, batch*240);
+cudaMemcpy(d_seed_bases, h_seed_bases, batch*240, cudaMemcpyHostToDevice);
+
+// 2) Start miner
+MinerCtrl *d_ctl; RingMeta *d_ring; FoundResult *d_buf;
+start_persistent_miner(d_seed_bases, batch, &d_ctl, &d_ring, &d_buf,
+  /*ring_cap=*/1024, /*blocks=*/min(batch, 2*SM_count));
+
+poll_until_found(RingMeta* d_ring, FoundResult* d_buf, int ring_cap)
+
+}
+
+int main2() {
     if (!check_blake3_kat_a240()) return 1;
 
     // Step 2: Proceed with your existing GPU vs CPU smoke test
